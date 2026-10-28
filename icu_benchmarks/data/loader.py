@@ -15,9 +15,16 @@ from icu_benchmarks.imputation.amputations import ampute_data
 from .constants import DataSegment as DataSegment
 from .constants import DataSplit as DataSplit
 
+GRUD_TIME_UNIT = "hours"
+
 
 def _grud_elapsed_time(sequence: np.ndarray, observed_mask: np.ndarray) -> np.ndarray:
-    """Return per-variable time since the previous observed value."""
+    """Return per-variable time since the previous observed value in hours.
+
+    YAIB numeric sequence values are explicitly interpreted as hours. Polars
+    durations and pandas timedeltas are normalized to the same unit here or in
+    ``CommonPolarsDataset`` before the recurrent cell sees them.
+    """
     raw_sequence = np.asarray(sequence)
     try:
         if np.issubdtype(raw_sequence.dtype, np.timedelta64):

@@ -1,4 +1,5 @@
 import numpy as np
+import gin
 import polars as pl
 import pytest
 import torch
@@ -6,7 +7,7 @@ import torch
 from icu_benchmarks.constants import RunMode
 from icu_benchmarks.data.constants import DataSegment, DataSplit
 from icu_benchmarks.data.loader import GRUDPredictionPolarsDataset
-from icu_benchmarks.models.dl_models.grud import GRUDNet
+from icu_benchmarks.models.dl_models.grud import GRUDNet, _GRUDCell
 
 
 VARS = {
@@ -102,6 +103,101 @@ def test_grud_frequency_changes_mask_and_elapsed_inputs():
     assert hidden[0][0][2][:, 0].tolist() == pytest.approx([0.0, 2.0, 2.0])
 
 
+def test_grud_subhour_numeric_timestamps_are_hours():
+    features = _features(times=(0.0, 0.25, 1.0), x_missing=(0.0, 1.0, 0.0))
+    dataset = GRUDPredictionPolarsDataset(_data(features), split=DataSplit.train, vars=VARS, ram_cache=False)
+    elapsed = dataset[0][0][2]
+    assert elapsed[:, 0].tolist() == pytest.approx([0.0, 0.25, 1.0])
+
+
+def test_grud_polars_duration_timestamps_are_converted_to_hours():
+    features = _features(times=(0.0, 15.0 * 60.0 * 1000.0, 60.0 * 60.0 * 1000.0), x_missing=(0.0, 1.0, 0.0))
+    features = features.with_columns(pl.col("time").cast(pl.Duration("ms")))
+    dataset = GRUDPredictionPolarsDataset(_data(features), split=DataSplit.train, vars=VARS, ram_cache=False)
+    elapsed = dataset[0][0][2]
+    assert elapsed[:, 0].tolist() == pytest.approx([0.0, 0.25, 1.0])
+
+
+def test_grud_candidate_and_final_update_follow_paper_equations():
+    cell = _GRUDCell(input_dim=1, hidden_dim=1)
+    with torch.no_grad():
+        cell.input_projection.weight.zero_()
+        cell.input_projection.bias.copy_(torch.tensor([0.0, 0.0, 0.2]))
+        cell.hidden_projection.weight.zero_()
+        cell.mask_projection.weight.zero_()
+        cell.candidate_hidden_projection.weight.fill_(2.0)
+        cell.input_decay_weight.zero_()
+        cell.input_decay_bias.zero_()
+        cell.hidden_decay_weight.zero_()
+        cell.hidden_decay_bias.fill_(0.5)
+
+    output = cell(
+        values=torch.zeros(1, 1, 1),
+        observed_mask=torch.zeros(1, 1, 1),
+        elapsed_time=torch.ones(1, 1, 1),
+        hidden=torch.ones(1, 1),
+        reference_means=torch.zeros(1),
+        sequence_mask=torch.ones(1, 1, dtype=torch.bool),
+    )
+    decayed_hidden = torch.exp(torch.tensor(-0.5))
+    candidate = torch.tanh(torch.tensor(0.2) + 2.0 * 0.5 * decayed_hidden)
+    expected = 0.5 * decayed_hidden + 0.5 * candidate
+    assert output.item() == pytest.approx(expected.item())
+
+
+def test_grud_missing_input_decays_toward_training_mean():
+    cell = _GRUDCell(input_dim=1, hidden_dim=1)
+    with torch.no_grad():
+        cell.input_projection.weight.zero_()
+        cell.input_projection.weight[2, 0] = 1.0
+        cell.input_projection.bias.copy_(torch.tensor([0.0, 20.0, 0.0]))
+        cell.hidden_projection.weight.zero_()
+        cell.mask_projection.weight.zero_()
+        cell.candidate_hidden_projection.weight.zero_()
+        cell.input_decay_weight.fill_(1.0)
+        cell.input_decay_bias.zero_()
+        cell.hidden_decay_weight.zero_()
+        cell.hidden_decay_bias.zero_()
+
+    output = cell(
+        values=torch.tensor([[[2.0], [2.0]]]),
+        observed_mask=torch.tensor([[[1.0], [0.0]]]),
+        elapsed_time=torch.tensor([[[0.0], [1.0]]]),
+        hidden=torch.zeros(1, 1),
+        reference_means=torch.tensor([0.5]),
+        sequence_mask=torch.ones(1, 2, dtype=torch.bool),
+    )
+    expected_input = torch.exp(torch.tensor(-1.0)) * 2.0 + (1.0 - torch.exp(torch.tensor(-1.0))) * 0.5
+    assert output[0, 1, 0].item() == pytest.approx(torch.tanh(expected_input).item(), abs=1e-5)
+
+
+def test_grud_decay_parameters_receive_gradients_and_update():
+    torch.manual_seed(7)
+    cell = _GRUDCell(input_dim=2, hidden_dim=3)
+    optimizer = torch.optim.SGD(cell.parameters(), lr=0.1)
+    before = {
+        name: parameter.detach().clone()
+        for name, parameter in cell.named_parameters()
+        if "decay" in name
+    }
+    output = cell(
+        values=torch.tensor([[[2.0, -1.0], [2.0, -1.0]]]),
+        observed_mask=torch.tensor([[[1.0, 1.0], [0.0, 0.0]]]),
+        elapsed_time=torch.tensor([[[0.0, 0.0], [1.0, 0.5]]]),
+        hidden=torch.zeros(1, 3),
+        reference_means=torch.tensor([0.5, -0.5]),
+        sequence_mask=torch.ones(1, 2, dtype=torch.bool),
+    )
+    output.sum().backward()
+    for name, parameter in cell.named_parameters():
+        if "decay" in name:
+            assert parameter.grad is not None and parameter.grad.abs().sum() > 0, name
+    optimizer.step()
+    for name, parameter in cell.named_parameters():
+        if "decay" in name:
+            assert not torch.equal(before[name], parameter), name
+
+
 def test_grud_output_shape_and_padding_state_are_stable():
     dataset = GRUDPredictionPolarsDataset(_data(), split=DataSplit.train, vars=VARS, ram_cache=False)
     first_inputs = dataset[0][0]
@@ -150,37 +246,49 @@ def test_grud_end_to_end_train_and_evaluate(tmp_path):
 
     data = _data()
     train_dir = tmp_path / "train"
-    score = train_common(
-        data,
-        log_dir=train_dir,
-        model=GRUDNet,
-        mode=RunMode.classification,
-        weight="balanced",
-        epochs=1,
-        batch_size=2,
-        patience=1,
-        cpu=True,
-        num_workers=0,
-        ram_cache=False,
-        verbose=False,
-    )
-    assert np.isfinite(score)
-    assert (train_dir / "model.ckpt").exists()
+    train_dir.mkdir()
+    gin.clear_config()
+    gin.bind_parameter("GRUDPredictionPolarsDataset.vars", VARS)
+    gin.bind_parameter("GRUDNet.hidden_dim", 4)
+    gin.bind_parameter("GRUDNet.layer_dim", 1)
+    gin.bind_parameter("GRUDNet.num_classes", 2)
+    gin.bind_parameter("DLPredictionWrapper.loss", torch.nn.functional.cross_entropy)
+    try:
+        score = train_common(
+            data,
+            log_dir=train_dir,
+            model=GRUDNet,
+            mode=RunMode.classification,
+            weight="balanced",
+            epochs=1,
+            batch_size=2,
+            patience=1,
+            cpu=True,
+            num_workers=0,
+            ram_cache=False,
+            verbose=False,
+        )
+        assert np.isfinite(score)
+        assert (train_dir / "model.ckpt").exists()
 
-    eval_score = train_common(
-        data,
-        log_dir=tmp_path / "eval",
-        model=GRUDNet,
-        mode=RunMode.classification,
-        weight="balanced",
-        eval_only=True,
-        load_weights=True,
-        source_dir=train_dir,
-        epochs=1,
-        batch_size=2,
-        cpu=True,
-        num_workers=0,
-        ram_cache=False,
-        verbose=False,
-    )
-    assert np.isfinite(eval_score)
+        eval_dir = tmp_path / "eval"
+        eval_dir.mkdir()
+        eval_score = train_common(
+            data,
+            log_dir=eval_dir,
+            model=GRUDNet,
+            mode=RunMode.classification,
+            weight="balanced",
+            eval_only=True,
+            load_weights=True,
+            source_dir=train_dir,
+            epochs=1,
+            batch_size=2,
+            cpu=True,
+            num_workers=0,
+            ram_cache=False,
+            verbose=False,
+        )
+        assert np.isfinite(eval_score)
+    finally:
+        gin.clear_config()

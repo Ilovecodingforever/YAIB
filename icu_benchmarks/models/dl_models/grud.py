@@ -12,19 +12,26 @@ from icu_benchmarks.models.wrappers import DLPredictionWrapper
 
 
 class _GRUDCell(nn.Module):
-    """One GRU-D recurrent layer for batch-first sequences."""
+    """One GRU-D recurrent layer following paper equations 10--16.
+
+    ``observed_mask`` follows the paper convention: one means observed and zero
+    means missing. Numeric timestamps and converted Polars durations are in
+    hours before they reach this cell.
+    """
 
     def __init__(self, input_dim: int, hidden_dim: int):
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.input_projection = nn.Linear(input_dim, 3 * hidden_dim)
-        self.hidden_projection = nn.Linear(hidden_dim, 3 * hidden_dim, bias=False)
+        self.hidden_projection = nn.Linear(hidden_dim, 2 * hidden_dim, bias=False)
         self.mask_projection = nn.Linear(input_dim, 3 * hidden_dim, bias=False)
-        self.input_decay_weight = nn.Parameter(torch.zeros(input_dim))
-        self.input_decay_bias = nn.Parameter(torch.zeros(input_dim))
-        self.hidden_decay_weight = nn.Parameter(torch.zeros(input_dim, hidden_dim))
-        self.hidden_decay_bias = nn.Parameter(torch.zeros(hidden_dim))
+        self.candidate_hidden_projection = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        # Positive initialization keeps exp(-ReLU(.)) differentiable at startup.
+        self.input_decay_weight = nn.Parameter(torch.full((input_dim,), 0.1))
+        self.input_decay_bias = nn.Parameter(torch.full((input_dim,), 0.1))
+        self.hidden_decay_weight = nn.Parameter(torch.full((input_dim, hidden_dim), 0.1))
+        self.hidden_decay_bias = nn.Parameter(torch.full((hidden_dim,), 0.1))
 
     def forward(
         self,
@@ -53,12 +60,19 @@ class _GRUDCell(nn.Module):
             x = mask * x + (1.0 - mask) * (gamma_x * last_observed + (1.0 - gamma_x) * reference_means)
             decayed_hidden = gamma_h * hidden
 
-            gates = self.input_projection(x) + self.hidden_projection(decayed_hidden) + self.mask_projection(mask)
-            update, reset, candidate = gates.chunk(3, dim=-1)
-            update = torch.sigmoid(update)
-            reset = torch.sigmoid(reset)
-            candidate = torch.tanh(candidate + reset * decayed_hidden)
-            next_hidden = (1.0 - update) * candidate + update * hidden
+            input_reset, input_update, input_candidate = self.input_projection(x).chunk(3, dim=-1)
+            hidden_reset, hidden_update = self.hidden_projection(decayed_hidden).chunk(2, dim=-1)
+            mask_reset, mask_update, mask_candidate = self.mask_projection(mask).chunk(3, dim=-1)
+
+            reset_gate = torch.sigmoid(input_reset + hidden_reset + mask_reset)
+            update_gate = torch.sigmoid(input_update + hidden_update + mask_update)
+            candidate = torch.tanh(
+                input_candidate
+                + self.candidate_hidden_projection(reset_gate * decayed_hidden)
+                + mask_candidate
+            )
+            # Paper convention: z=1 selects the candidate and z=0 retains h-hat.
+            next_hidden = (1.0 - update_gate) * decayed_hidden + update_gate * candidate
             hidden = torch.where(sequence_mask[:, timestep].unsqueeze(-1), next_hidden, hidden)
             outputs.append(hidden)
         return torch.stack(outputs, dim=1)
