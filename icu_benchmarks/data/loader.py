@@ -38,7 +38,13 @@ class CommonPolarsDataset(Dataset):
             # We have a time series dataset
             self.row_indicators = data[split][DataSegment.features][self.vars["GROUP"], self.vars["SEQUENCE"]]
 
-            self.row_indicators = self.row_indicators.with_columns(pl.col(self.vars["SEQUENCE"]))  # already in hours?
+            sequence = self.vars["SEQUENCE"]
+            if self.row_indicators.schema[sequence].base_type() == pl.Duration:
+                self.row_indicators = self.row_indicators.with_columns(
+                    (
+                        pl.col(sequence).dt.total_seconds(fractional=True) / 3600.0
+                    ).alias(sequence)
+                )
             self.features_df = data[split][DataSegment.features]
             self.features_df = self.features_df.sort([self.vars["GROUP"], self.vars["SEQUENCE"]])
             self.features_df = self.features_df.drop(self.vars["SEQUENCE"])
