@@ -1,5 +1,6 @@
 import logging
 import warnings
+from datetime import date, datetime, timedelta
 from typing import List, Optional, Union
 
 import gin
@@ -16,27 +17,102 @@ from .constants import DataSegment as DataSegment
 from .constants import DataSplit as DataSplit
 
 GRUD_TIME_UNIT = "hours"
+_GRUD_TIME_FACTORS = {"hours": 1.0, "minutes": 1.0 / 60.0, "seconds": 1.0 / 3600.0}
 
 
-def _grud_elapsed_time(sequence: np.ndarray, observed_mask: np.ndarray) -> np.ndarray:
-    """Return per-variable time since the previous observed value in hours.
+def _grud_validate_time_unit(time_unit: str) -> None:
+    if time_unit not in _GRUD_TIME_FACTORS:
+        raise ValueError(
+            "GRU-D numeric_time_unit must be one of 'hours', 'minutes', or 'seconds'; "
+            f"got {time_unit!r}."
+        )
 
-    YAIB numeric sequence values are explicitly interpreted as hours. Polars
-    durations and pandas timedeltas are normalized to the same unit here or in
-    ``CommonPolarsDataset`` before the recurrent cell sees them.
+
+def _grud_timestamp_hours(sequence, numeric_time_unit: str, stay_id=None) -> np.ndarray:
+    """Convert one stay's timestamps to relative hours without losing precision.
+
+    Numeric timestamps require ``numeric_time_unit``; no unit is inferred from
+    magnitude. Duplicate timestamps are allowed, retain stable input order,
+    and produce a zero gap. Mixed timezone-aware and naive datetimes are
+    rejected because their ordering is ambiguous.
     """
-    raw_sequence = np.asarray(sequence)
-    try:
-        if np.issubdtype(raw_sequence.dtype, np.timedelta64):
-            raise TypeError
-        sequence = raw_sequence.astype(np.float32)
-    except (TypeError, ValueError):
-        sequence = pd.to_timedelta(sequence).total_seconds().to_numpy(dtype=np.float32) / 3600.0
+    _grud_validate_time_unit(numeric_time_unit)
+
+    raw = np.asarray(sequence)
+    if raw.ndim != 1 or raw.size == 0:
+        raise ValueError(f"GRU-D timestamps for stay {stay_id!r} must be a non-empty one-dimensional sequence.")
+
+    non_null = [value for value in raw.tolist() if value is not None and not pd.isna(value)]
+    if len(non_null) != raw.size:
+        raise ValueError(f"GRU-D timestamps for stay {stay_id!r} contain missing values.")
+
+    is_timedelta = np.issubdtype(raw.dtype, np.timedelta64) or all(
+        isinstance(value, (timedelta, np.timedelta64, pd.Timedelta)) for value in non_null
+    )
+    is_datetime = np.issubdtype(raw.dtype, np.datetime64) or all(
+        isinstance(value, (datetime, date, np.datetime64, pd.Timestamp)) for value in non_null
+    )
+    if is_timedelta:
+        try:
+            converted = pd.to_timedelta(raw)
+            relative = converted - converted[0]
+            hours = np.asarray(relative.total_seconds(), dtype=np.float64) / 3600.0
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(f"Could not convert GRU-D timedeltas for stay {stay_id!r}: {error}") from error
+    elif is_datetime:
+        aware = [pd.Timestamp(value).tzinfo is not None for value in non_null]
+        if any(aware) and not all(aware):
+            raise ValueError(f"GRU-D timestamps for stay {stay_id!r} mix timezone-aware and naive datetimes.")
+        try:
+            converted = pd.to_datetime(raw, utc=True)
+            relative = converted - converted[0]
+            hours = np.asarray(relative.total_seconds(), dtype=np.float64) / 3600.0
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(f"Could not convert GRU-D datetimes for stay {stay_id!r}: {error}") from error
+    else:
+        try:
+            numeric = np.asarray(raw, dtype=np.float64)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"Unsupported GRU-D timestamp format for stay {stay_id!r}; use numeric values with an explicit "
+                "numeric_time_unit, Polars/pandas durations, or datetimes."
+            ) from error
+        if not np.isfinite(numeric).all():
+            raise ValueError(f"GRU-D timestamps for stay {stay_id!r} contain nonfinite values.")
+        # Subtract before scaling/casting: this preserves subhour gaps near a modern epoch.
+        hours = (numeric - numeric[0]) * _GRUD_TIME_FACTORS[numeric_time_unit]
+
+    if not np.isfinite(hours).all():
+        raise ValueError(f"GRU-D timestamps for stay {stay_id!r} contain nonfinite values.")
+    if np.any(np.diff(hours) < 0):
+        raise ValueError(f"GRU-D timestamps for stay {stay_id!r} decrease; timestamps must be nondecreasing.")
+    return hours.astype(np.float32)
+
+
+def _grud_elapsed_time(
+    sequence: np.ndarray,
+    observed_mask: np.ndarray,
+    numeric_time_unit: str,
+    stay_id=None,
+) -> np.ndarray:
+    """Return per-variable hours since the previous observed value.
+
+    ``observed_mask`` uses YAIB's polarity: one means the measurement was
+    observed. Missing rows leave the last-observation timestamp unchanged.
+    """
     observed_mask = np.asarray(observed_mask, dtype=np.float32)
+    if observed_mask.ndim != 2:
+        raise ValueError("GRU-D observed_mask must be a two-dimensional array.")
+    timestamps = _grud_timestamp_hours(sequence, numeric_time_unit, stay_id)
+    if len(timestamps) != observed_mask.shape[0]:
+        raise ValueError(
+            f"GRU-D timestamps and observed_mask disagree for stay {stay_id!r}: "
+            f"{len(timestamps)} timestamps versus {observed_mask.shape[0]} rows."
+        )
     elapsed = np.zeros_like(observed_mask, dtype=np.float32)
-    last_observation = np.full(observed_mask.shape[1], sequence[0], dtype=np.float32)
-    for timestep, timestamp in enumerate(sequence):
-        elapsed[timestep] = np.maximum(timestamp - last_observation, 0.0)
+    last_observation = np.zeros(observed_mask.shape[1], dtype=np.float32)
+    for timestep, timestamp in enumerate(timestamps):
+        elapsed[timestep] = timestamp - last_observation
         last_observation[observed_mask[timestep] > 0.5] = timestamp
     return elapsed
 
@@ -352,32 +428,43 @@ class GRUDPredictionPolarsDataset(PredictionPolarsDataset):
             logging.info(f"Caching {self.split} GRU-D dataset in ram.")
             self._cached_dataset = [self[i] for i in range(len(self))]
 
-    def __init__(self, *args, reference_means: Optional[np.ndarray] = None, ram_cache: bool = True, **kwargs):
+    def __init__(
+        self,
+        *args,
+        reference_means: Optional[np.ndarray] = None,
+        time_unit: str = gin.REQUIRED,
+        ram_cache: bool = True,
+        **kwargs,
+    ):
         data = args[0] if args else kwargs["data"]
+        _grud_validate_time_unit(time_unit)
         super().__init__(*args, ram_cache=False, **kwargs)
-        dynamic, indicators, static = _grud_validate_columns(self.features_df, self.vars)
+        # CommonPolarsDataset converts its row indicators to hours for legacy
+        # models. GRU-D uses the raw sequence column here so conversion occurs
+        # exactly once in _grud_timestamp_hours.
+        raw_features = data[self.split][DataSegment.features].sort(
+            [self.vars["GROUP"], self.vars["SEQUENCE"]], maintain_order=True
+        )
+        dynamic, indicators, static = _grud_validate_columns(raw_features, self.vars)
         self._grud_dynamic_names = dynamic
         self._grud_indicator_names = indicators
         self._grud_static_names = static
 
-        feature_names = [name for name in self.features_df.columns if name != self.vars["GROUP"]]
-        dynamic_indices = [feature_names.index(name) for name in dynamic]
-        indicator_indices = [feature_names.index(name) for name in indicators]
-        static_indices = [feature_names.index(name) for name in static]
-
         self._grud_dynamic_arrays = {}
         self._grud_mask_arrays = {}
         self._grud_static_arrays = {}
-        for stay_id, values in self._feat_arrays.items():
-            self._grud_dynamic_arrays[stay_id] = values[:, dynamic_indices]
-            self._grud_mask_arrays[stay_id] = 1.0 - values[:, indicator_indices]
-            self._grud_static_arrays[stay_id] = values[0, static_indices] if static_indices else np.zeros(0, dtype=np.float32)
+        self._grud_sequence_arrays = {}
+        group = self.vars["GROUP"]
+        for part in raw_features.partition_by(group, maintain_order=True):
+            stay_id = part[group][0]
+            self._grud_dynamic_arrays[stay_id] = part.select(dynamic).to_numpy().astype(np.float32)
+            self._grud_mask_arrays[stay_id] = 1.0 - part.select(indicators).to_numpy().astype(np.float32)
+            self._grud_static_arrays[stay_id] = (
+                part.select(static).to_numpy()[0].astype(np.float32) if static else np.zeros(0, dtype=np.float32)
+            )
+            self._grud_sequence_arrays[stay_id] = part[self.vars["SEQUENCE"]].to_numpy()
 
-        sequence = self.row_indicators.sort([self.vars["GROUP"], self.vars["SEQUENCE"]])
-        self._grud_sequence_arrays = {
-            part[self.vars["GROUP"]][0]: part[self.vars["SEQUENCE"]].to_numpy().astype(np.float32)
-            for part in sequence.partition_by(self.vars["GROUP"], maintain_order=True)
-        }
+        self.time_unit = time_unit
 
         self.reference_means = (
             np.asarray(reference_means, dtype=np.float32).copy()
@@ -396,7 +483,7 @@ class GRUDPredictionPolarsDataset(PredictionPolarsDataset):
         values = self._grud_dynamic_arrays[stay_id].copy()
         observed_mask = self._grud_mask_arrays[stay_id].copy()
         sequence = self._grud_sequence_arrays[stay_id]
-        elapsed_time = _grud_elapsed_time(sequence, observed_mask)
+        elapsed_time = _grud_elapsed_time(sequence, observed_mask, self.time_unit, stay_id)
         labels = self._label_arrays[stay_id].copy()
         return _grud_pad_item(
             values,
@@ -570,11 +657,19 @@ class GRUDPredictionPandasDataset(PredictionPandasDataset):
             logging.info(f"Caching {self.split} GRU-D dataset in ram.")
             self._cached_dataset = [self[i] for i in range(len(self))]
 
-    def __init__(self, *args, reference_means: Optional[np.ndarray] = None, ram_cache: bool = True, **kwargs):
+    def __init__(
+        self,
+        *args,
+        reference_means: Optional[np.ndarray] = None,
+        time_unit: str = gin.REQUIRED,
+        ram_cache: bool = True,
+        **kwargs,
+    ):
         data = args[0] if args else kwargs["data"]
+        _grud_validate_time_unit(time_unit)
         super().__init__(*args, ram_cache=False, **kwargs)
         raw_features = data[self.split][DataSegment.features].sort_values(
-            [self.vars["GROUP"], self.vars["SEQUENCE"]]
+            [self.vars["GROUP"], self.vars["SEQUENCE"]], kind="stable"
         )
         dynamic, indicators, static = _grud_validate_columns(raw_features, self.vars)
         self._grud_dynamic_names = dynamic
@@ -586,6 +681,7 @@ class GRUDPredictionPandasDataset(PredictionPandasDataset):
         self._grud_sequence_arrays = {}
         self._grud_label_arrays = {}
         self._grud_stay_order = list(self.outcome_df.index.unique())
+        self.time_unit = time_unit
         group = self.vars["GROUP"]
         label = self.vars["LABEL"]
         outcome = data[self.split][DataSegment.outcome]
@@ -614,7 +710,9 @@ class GRUDPredictionPandasDataset(PredictionPandasDataset):
         stay_id = self._grud_stay_order[idx]
         values = self._grud_dynamic_arrays[stay_id].copy()
         observed_mask = self._grud_mask_arrays[stay_id].copy()
-        elapsed_time = _grud_elapsed_time(self._grud_sequence_arrays[stay_id], observed_mask)
+        elapsed_time = _grud_elapsed_time(
+            self._grud_sequence_arrays[stay_id], observed_mask, self.time_unit, stay_id
+        )
         return _grud_pad_item(
             values,
             observed_mask,

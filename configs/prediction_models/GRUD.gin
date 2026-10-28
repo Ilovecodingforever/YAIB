@@ -5,6 +5,11 @@
 
 include "configs/prediction_models/common/DLCommon.gin"
 
+# Demo YAIB cohorts store numeric sequence values in hours. Override these
+# bindings for cohorts whose numeric timestamps use another explicit unit.
+GRUDPredictionPolarsDataset.time_unit = "hours"
+GRUDPredictionPandasDataset.time_unit = "hours"
+
 train_common.model = @GRUDNet
 
 optimizer/hyperparameter.class_to_tune = @Adam

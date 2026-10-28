@@ -1,12 +1,14 @@
 import numpy as np
 import gin
+import pandas as pd
 import polars as pl
 import pytest
 import torch
+from datetime import datetime, timezone, timedelta
 
 from icu_benchmarks.constants import RunMode
 from icu_benchmarks.data.constants import DataSegment, DataSplit
-from icu_benchmarks.data.loader import GRUDPredictionPolarsDataset
+from icu_benchmarks.data.loader import GRUDPredictionPandasDataset, GRUDPredictionPolarsDataset, _grud_elapsed_time
 from icu_benchmarks.models.dl_models.grud import GRUDNet, _GRUDCell
 
 
@@ -22,10 +24,11 @@ VARS = {
 def _features(times=(0.0, 1.0, 4.0), x_missing=(0.0, 1.0, 0.0)):
     times = list(times)
     x_missing = list(x_missing)
+    second_times = [times[0], times[min(1, len(times) - 1)]]
     return pl.DataFrame(
         {
             "stay_id": [1] * len(times) + [2, 2],
-            "time": times + [0.0, 2.0],
+            "time": times + second_times,
             "x": [2.0, 3.0, 5.0][: len(times)] + [7.0, 8.0],
             "y": [10.0, 11.0, 12.0][: len(times)] + [13.0, 14.0],
             "MissingIndicator_x": x_missing + [0.0, 1.0],
@@ -46,7 +49,7 @@ def _data(features=None):
 
 
 def test_grud_dataset_exposes_observed_masks_and_elapsed_times():
-    dataset = GRUDPredictionPolarsDataset(_data(), split=DataSplit.train, vars=VARS, ram_cache=False)
+    dataset = GRUDPredictionPolarsDataset(_data(), split=DataSplit.train, vars=VARS, time_unit="hours", ram_cache=False)
     inputs, _, prediction_mask = dataset[0]
     values, observed, elapsed, static, sequence_mask = inputs
 
@@ -65,11 +68,12 @@ def test_grud_means_are_training_only_and_missing_training_variables_are_explici
     val_features = _features().with_columns(pl.lit(100.0).alias("x"))
     data = _data(train_features)
     data[DataSplit.val][DataSegment.features] = val_features
-    train = GRUDPredictionPolarsDataset(data, split=DataSplit.train, vars=VARS, ram_cache=False)
+    train = GRUDPredictionPolarsDataset(data, split=DataSplit.train, vars=VARS, time_unit="hours", ram_cache=False)
     val = GRUDPredictionPolarsDataset(
         data,
         split=DataSplit.val,
         vars=VARS,
+        time_unit="hours",
         reference_means=train.get_reference_means(),
         ram_cache=False,
     )
@@ -78,15 +82,15 @@ def test_grud_means_are_training_only_and_missing_training_variables_are_explici
 
     no_observations = train_features.with_columns(pl.lit(1.0).alias("MissingIndicator_x"))
     no_obs_data = _data(no_observations)
-    no_obs = GRUDPredictionPolarsDataset(no_obs_data, split=DataSplit.train, vars=VARS, ram_cache=False)
+    no_obs = GRUDPredictionPolarsDataset(no_obs_data, split=DataSplit.train, vars=VARS, time_unit="hours", ram_cache=False)
     assert no_obs.get_reference_means()[0] == 0.0
 
 
 def test_grud_frequency_changes_mask_and_elapsed_inputs():
-    regular = GRUDPredictionPolarsDataset(_data(), split=DataSplit.train, vars=VARS, ram_cache=False)
+    regular = GRUDPredictionPolarsDataset(_data(), split=DataSplit.train, vars=VARS, time_unit="hours", ram_cache=False)
     sparse_features = _features(times=(0.0, 2.0, 4.0), x_missing=(0.0, 1.0, 0.0))
     sparse = GRUDPredictionPolarsDataset(
-        _data(sparse_features), split=DataSplit.train, vars=VARS, ram_cache=False
+        _data(sparse_features), split=DataSplit.train, vars=VARS, time_unit="hours", ram_cache=False
     )
     regular_inputs = regular[0][0]
     sparse_inputs = sparse[0][0]
@@ -97,6 +101,7 @@ def test_grud_frequency_changes_mask_and_elapsed_inputs():
         _data(_features(times=(0.0, 2.0, 4.0), x_missing=(0.0, 0.0, 0.0))),
         split=DataSplit.train,
         vars=VARS,
+        time_unit="hours",
         ram_cache=False,
     )
     assert hidden[0][0][1][:, 0].tolist() == [1.0, 1.0, 1.0]
@@ -105,7 +110,7 @@ def test_grud_frequency_changes_mask_and_elapsed_inputs():
 
 def test_grud_subhour_numeric_timestamps_are_hours():
     features = _features(times=(0.0, 0.25, 1.0), x_missing=(0.0, 1.0, 0.0))
-    dataset = GRUDPredictionPolarsDataset(_data(features), split=DataSplit.train, vars=VARS, ram_cache=False)
+    dataset = GRUDPredictionPolarsDataset(_data(features), split=DataSplit.train, vars=VARS, time_unit="hours", ram_cache=False)
     elapsed = dataset[0][0][2]
     assert elapsed[:, 0].tolist() == pytest.approx([0.0, 0.25, 1.0])
 
@@ -113,9 +118,107 @@ def test_grud_subhour_numeric_timestamps_are_hours():
 def test_grud_polars_duration_timestamps_are_converted_to_hours():
     features = _features(times=(0.0, 15.0 * 60.0 * 1000.0, 60.0 * 60.0 * 1000.0), x_missing=(0.0, 1.0, 0.0))
     features = features.with_columns(pl.col("time").cast(pl.Duration("ms")))
-    dataset = GRUDPredictionPolarsDataset(_data(features), split=DataSplit.train, vars=VARS, ram_cache=False)
+    dataset = GRUDPredictionPolarsDataset(_data(features), split=DataSplit.train, vars=VARS, time_unit="hours", ram_cache=False)
     elapsed = dataset[0][0][2]
     assert elapsed[:, 0].tolist() == pytest.approx([0.0, 0.25, 1.0])
+
+
+@pytest.mark.parametrize(
+    ("unit", "times"),
+    [
+        ("hours", (10.0, 10.25, 11.0)),
+        ("minutes", (600.0, 615.0, 660.0)),
+        ("seconds", (36000.0, 36900.0, 39600.0)),
+    ],
+)
+def test_grud_numeric_timestamp_units_are_explicit_and_equivalent(unit, times):
+    dataset = GRUDPredictionPolarsDataset(
+        _data(_features(times=times)), split=DataSplit.train, vars=VARS, time_unit=unit, ram_cache=False
+    )
+    assert dataset[0][0][2][:, 0].tolist() == pytest.approx([0.0, 0.25, 1.0])
+
+
+def test_grud_elapsed_time_accumulates_across_consecutive_missing_rows():
+    elapsed = _grud_elapsed_time(
+        np.array([100.0, 115.0, 130.0, 160.0]),
+        np.array([[1.0], [0.0], [0.0], [1.0]]),
+        "minutes",
+        stay_id=7,
+    )
+    assert elapsed[:, 0].tolist() == pytest.approx([0.0, 0.25, 0.5, 1.0])
+
+
+def test_grud_pandas_timedeltas_and_absolute_datetimes_match_polars():
+    relative = [0.0, 0.25, 1.0]
+    polars_features = _features(times=relative)
+    pandas_features = pd.DataFrame(polars_features.to_dict(as_series=False))
+    pandas_features["time"] = pd.to_timedelta([0, 15, 60, 0, 15], unit="m")
+    pandas_data = {
+        split: {
+            DataSegment.features: pandas_features.copy(),
+            DataSegment.outcome: pd.DataFrame({"stay_id": [1, 2], "label": [0.0, 1.0]}),
+        }
+        for split in (DataSplit.train, DataSplit.val, DataSplit.test)
+    }
+    pandas_dataset = GRUDPredictionPandasDataset(
+        pandas_data, split=DataSplit.train, vars=VARS, time_unit="hours", ram_cache=False
+    )
+    assert pandas_dataset[0][0][2][:, 0].tolist() == pytest.approx([0.0, 0.25, 1.0])
+
+    absolute = [pd.Timestamp("2024-01-01T00:00:00"), pd.Timestamp("2024-01-01T00:15:00"), pd.Timestamp("2024-01-01T01:00:00")]
+    absolute_features = _features(times=absolute)
+    absolute_dataset = GRUDPredictionPolarsDataset(
+        _data(absolute_features), split=DataSplit.train, vars=VARS, time_unit="hours", ram_cache=False
+    )
+    assert absolute_dataset[0][0][2][:, 0].tolist() == pytest.approx([0.0, 0.25, 1.0])
+
+    absolute_pandas = pandas_features.copy()
+    absolute_pandas["time"] = [
+        pd.Timestamp("2024-01-01T00:00:00"),
+        pd.Timestamp("2024-01-01T00:15:00"),
+        pd.Timestamp("2024-01-01T01:00:00"),
+        pd.Timestamp("2024-01-01T00:00:00"),
+        pd.Timestamp("2024-01-01T00:15:00"),
+    ]
+    absolute_pandas_data = {
+        split: {
+            DataSegment.features: absolute_pandas.copy(),
+            DataSegment.outcome: pd.DataFrame({"stay_id": [1, 2], "label": [0.0, 1.0]}),
+        }
+        for split in (DataSplit.train, DataSplit.val, DataSplit.test)
+    }
+    absolute_pandas_dataset = GRUDPredictionPandasDataset(
+        absolute_pandas_data, split=DataSplit.train, vars=VARS, time_unit="hours", ram_cache=False
+    )
+    assert absolute_pandas_dataset[0][0][2][:, 0].tolist() == pytest.approx([0.0, 0.25, 1.0])
+
+
+def test_grud_numeric_time_unit_is_required():
+    with pytest.raises(RuntimeError, match="time_unit"):
+        GRUDPredictionPolarsDataset(_data(), split=DataSplit.train, vars=VARS, ram_cache=False)
+
+
+def test_grud_rejects_invalid_or_decreasing_timestamps_and_allows_duplicates():
+    mask = np.ones((3, 1), dtype=np.float32)
+    with pytest.raises(ValueError, match="decrease"):
+        _grud_elapsed_time(np.array([0.0, 2.0, 1.0]), mask, "hours", stay_id=3)
+    with pytest.raises(ValueError, match="nonfinite"):
+        _grud_elapsed_time(np.array([0.0, np.inf, 1.0]), mask, "hours", stay_id=3)
+    duplicate = _grud_elapsed_time(np.array([0.0, 0.0, 1.0]), mask, "hours", stay_id=3)
+    assert duplicate[:, 0].tolist() == pytest.approx([0.0, 0.0, 1.0])
+
+
+def test_grud_timezone_aware_datetimes_are_normalized_before_subtraction():
+    timestamps = np.array(
+        [
+            datetime(2024, 1, 1, tzinfo=timezone.utc),
+            datetime(2024, 1, 1, 1, 15, tzinfo=timezone(timedelta(hours=1))),
+            datetime(2024, 1, 1, 1, tzinfo=timezone.utc),
+        ],
+        dtype=object,
+    )
+    elapsed = _grud_elapsed_time(timestamps, np.ones((3, 1), dtype=np.float32), "hours")
+    assert elapsed[:, 0].tolist() == pytest.approx([0.0, 0.25, 0.75])
 
 
 def test_grud_candidate_and_final_update_follow_paper_equations():
@@ -199,7 +302,7 @@ def test_grud_decay_parameters_receive_gradients_and_update():
 
 
 def test_grud_output_shape_and_padding_state_are_stable():
-    dataset = GRUDPredictionPolarsDataset(_data(), split=DataSplit.train, vars=VARS, ram_cache=False)
+    dataset = GRUDPredictionPolarsDataset(_data(), split=DataSplit.train, vars=VARS, time_unit="hours", ram_cache=False)
     first_inputs = dataset[0][0]
     second_inputs = dataset[1][0]
     model = GRUDNet(
@@ -220,7 +323,7 @@ def test_grud_output_shape_and_padding_state_are_stable():
 
 
 def test_grud_checkpoint_persists_reference_means():
-    dataset = GRUDPredictionPolarsDataset(_data(), split=DataSplit.train, vars=VARS, ram_cache=False)
+    dataset = GRUDPredictionPolarsDataset(_data(), split=DataSplit.train, vars=VARS, time_unit="hours", ram_cache=False)
     inputs = dataset[0][0]
     model = GRUDNet(
         input_size=tuple(value.shape for value in inputs),
@@ -249,6 +352,7 @@ def test_grud_end_to_end_train_and_evaluate(tmp_path):
     train_dir.mkdir()
     gin.clear_config()
     gin.bind_parameter("GRUDPredictionPolarsDataset.vars", VARS)
+    gin.bind_parameter("GRUDPredictionPolarsDataset.time_unit", "hours")
     gin.bind_parameter("GRUDNet.hidden_dim", 4)
     gin.bind_parameter("GRUDNet.layer_dim", 1)
     gin.bind_parameter("GRUDNet.num_classes", 2)
