@@ -196,6 +196,22 @@ model/hyperparameter.example_length=25
 
 After these steps, your model should be trainable with the following command:
 
+For the YAIB GRU-D implementation, use the same workflow with the `GRUD` model config:
+
+```bash
+uv run icu-benchmarks train \
+    -d demo_data/mortality24/mimic_demo \
+    -n mimic_demo \
+    -t BinaryClassification \
+    -tn Mortality24 \
+    -m GRUD \
+    --cpu \
+    --tune \
+    -l ../yaib_logs/
+```
+
+The generic example command is:
+
 ```
 icu-benchmarks train \
     -d demo_data/mortality24/mimic_demo \ # Insert cohort dataset here

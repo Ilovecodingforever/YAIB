@@ -28,6 +28,7 @@ parameters:
       - LogisticRegression
       - LGBMClassifier
       - GRU
+      - GRUD
       - LSTM
       - TCN
       - Transformer

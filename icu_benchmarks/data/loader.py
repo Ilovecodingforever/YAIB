@@ -4,6 +4,7 @@ from typing import List, Optional, Union
 
 import gin
 import numpy as np
+import pandas as pd
 import polars as pl
 from pandas import DataFrame
 from torch import Tensor, cat, float32, from_numpy
@@ -13,6 +14,110 @@ from icu_benchmarks.imputation.amputations import ampute_data
 
 from .constants import DataSegment as DataSegment
 from .constants import DataSplit as DataSplit
+
+
+def _grud_elapsed_time(sequence: np.ndarray, observed_mask: np.ndarray) -> np.ndarray:
+    """Return per-variable time since the previous observed value."""
+    raw_sequence = np.asarray(sequence)
+    try:
+        if np.issubdtype(raw_sequence.dtype, np.timedelta64):
+            raise TypeError
+        sequence = raw_sequence.astype(np.float32)
+    except (TypeError, ValueError):
+        sequence = pd.to_timedelta(sequence).total_seconds().to_numpy(dtype=np.float32) / 3600.0
+    observed_mask = np.asarray(observed_mask, dtype=np.float32)
+    elapsed = np.zeros_like(observed_mask, dtype=np.float32)
+    last_observation = np.full(observed_mask.shape[1], sequence[0], dtype=np.float32)
+    for timestep, timestamp in enumerate(sequence):
+        elapsed[timestep] = np.maximum(timestamp - last_observation, 0.0)
+        last_observation[observed_mask[timestep] > 0.5] = timestamp
+    return elapsed
+
+
+def _grud_reference_means(features, vars: dict[str, Union[str, list[str]]]) -> np.ndarray:
+    """Calculate means from observed training values in model/value space."""
+    dynamic = list(vars.get(DataSegment.dynamic, []))
+    indicator_names = [f"MissingIndicator_{name}" for name in dynamic]
+    if hasattr(features, "select"):
+        values = features.select(dynamic).to_numpy().astype(np.float32)
+        missing = features.select(indicator_names).to_numpy().astype(np.float32)
+    else:
+        values = features[dynamic].to_numpy(dtype=np.float32)
+        missing = features[indicator_names].to_numpy(dtype=np.float32)
+    means = np.zeros(len(dynamic), dtype=np.float32)
+    for index in range(len(dynamic)):
+        observed = (missing[:, index] < 0.5) & np.isfinite(values[:, index])
+        if observed.any():
+            means[index] = values[observed, index].mean()
+        else:
+            logging.warning(
+                "GRU-D variable %s has no observed training values; using zero as its reference mean.",
+                dynamic[index],
+            )
+    return means
+
+
+def _grud_validate_columns(features, vars: dict[str, Union[str, list[str]]]) -> tuple[list[str], list[str], list[str]]:
+    columns = set(features.columns)
+    dynamic = list(vars.get(DataSegment.dynamic, []))
+    if not dynamic:
+        raise ValueError("GRU-D requires at least one dynamic variable.")
+    missing_indicators = [f"MissingIndicator_{name}" for name in dynamic]
+    missing = [name for name in dynamic + missing_indicators if name not in columns]
+    if missing:
+        raise ValueError(
+            "GRU-D requires preprocessed dynamic values and MissingIndicator columns; "
+            f"missing columns: {missing}"
+        )
+    static = [name for name in vars.get(DataSegment.static, []) if name in columns]
+    static += [
+        f"MissingIndicator_{name}"
+        for name in vars.get(DataSegment.static, [])
+        if f"MissingIndicator_{name}" in columns
+    ]
+    return dynamic, missing_indicators, static
+
+
+def _grud_pad_item(
+    values: np.ndarray,
+    observed_mask: np.ndarray,
+    elapsed_time: np.ndarray,
+    static: np.ndarray,
+    labels: np.ndarray,
+    maxlen: int,
+) -> tuple[list[Tensor], Tensor, Tensor]:
+    if len(labels) == 1:
+        labels = np.concatenate(
+            [np.full((values.shape[0] - 1, *labels.shape[1:]), np.nan), labels],
+            axis=0,
+        )
+
+    length_diff = maxlen - values.shape[0]
+    sequence_mask = np.ones(values.shape[0], dtype=bool)
+    if length_diff > 0:
+        pad_shape = (length_diff, values.shape[1])
+        values = np.concatenate([values, np.zeros(pad_shape, dtype=np.float32)], axis=0)
+        observed_mask = np.concatenate([observed_mask, np.zeros(pad_shape, dtype=np.float32)], axis=0)
+        elapsed_time = np.concatenate([elapsed_time, np.zeros(pad_shape, dtype=np.float32)], axis=0)
+        labels = np.concatenate([labels, np.full((length_diff, *labels.shape[1:]), np.nan)], axis=0)
+        sequence_mask = np.concatenate([sequence_mask, np.zeros(length_diff, dtype=bool)], axis=0)
+
+    nan_mask = np.isnan(labels)
+    labels[nan_mask] = -1
+    invalid_rows = nan_mask if labels.ndim == 1 else nan_mask.any(axis=-1)
+    prediction_mask = sequence_mask.copy()
+    prediction_mask[invalid_rows] = False
+    return (
+        [
+            from_numpy(values.astype(np.float32)),
+            from_numpy(observed_mask.astype(np.float32)),
+            from_numpy(elapsed_time.astype(np.float32)),
+            from_numpy(static.astype(np.float32)),
+            from_numpy(sequence_mask),
+        ],
+        from_numpy(labels.astype(np.float32)),
+        from_numpy(prediction_mask),
+    )
 
 
 @gin.configurable("CommonPolarsDataset")
@@ -229,6 +334,73 @@ class PredictionPolarsDataset(CommonPolarsDataset):
         )
 
 
+@gin.configurable("GRUDPredictionPolarsDataset")
+class GRUDPredictionPolarsDataset(PredictionPolarsDataset):
+    """Prediction dataset that exposes values, masks, deltas, and static context to GRU-D."""
+
+    def ram_cache(self, cache: bool = True):
+        # PredictionPolarsDataset calls this from its constructor before GRU-D arrays exist.
+        self._cached_dataset = None
+        if cache and hasattr(self, "_grud_dynamic_arrays"):
+            logging.info(f"Caching {self.split} GRU-D dataset in ram.")
+            self._cached_dataset = [self[i] for i in range(len(self))]
+
+    def __init__(self, *args, reference_means: Optional[np.ndarray] = None, ram_cache: bool = True, **kwargs):
+        data = args[0] if args else kwargs["data"]
+        super().__init__(*args, ram_cache=False, **kwargs)
+        dynamic, indicators, static = _grud_validate_columns(self.features_df, self.vars)
+        self._grud_dynamic_names = dynamic
+        self._grud_indicator_names = indicators
+        self._grud_static_names = static
+
+        feature_names = [name for name in self.features_df.columns if name != self.vars["GROUP"]]
+        dynamic_indices = [feature_names.index(name) for name in dynamic]
+        indicator_indices = [feature_names.index(name) for name in indicators]
+        static_indices = [feature_names.index(name) for name in static]
+
+        self._grud_dynamic_arrays = {}
+        self._grud_mask_arrays = {}
+        self._grud_static_arrays = {}
+        for stay_id, values in self._feat_arrays.items():
+            self._grud_dynamic_arrays[stay_id] = values[:, dynamic_indices]
+            self._grud_mask_arrays[stay_id] = 1.0 - values[:, indicator_indices]
+            self._grud_static_arrays[stay_id] = values[0, static_indices] if static_indices else np.zeros(0, dtype=np.float32)
+
+        sequence = self.row_indicators.sort([self.vars["GROUP"], self.vars["SEQUENCE"]])
+        self._grud_sequence_arrays = {
+            part[self.vars["GROUP"]][0]: part[self.vars["SEQUENCE"]].to_numpy().astype(np.float32)
+            for part in sequence.partition_by(self.vars["GROUP"], maintain_order=True)
+        }
+
+        self.reference_means = (
+            np.asarray(reference_means, dtype=np.float32).copy()
+            if reference_means is not None
+            else _grud_reference_means(data[DataSplit.train][DataSegment.features], self.vars)
+        )
+        if self.reference_means.shape != (len(dynamic),):
+            raise ValueError(f"Expected {len(dynamic)} GRU-D reference means, got shape {self.reference_means.shape}.")
+        self.ram_cache(ram_cache)
+
+    def get_reference_means(self) -> np.ndarray:
+        return self.reference_means.copy()
+
+    def _build_item(self, idx: int) -> tuple[list[Tensor], Tensor, Tensor]:
+        stay_id = self._stay_order[idx]
+        values = self._grud_dynamic_arrays[stay_id].copy()
+        observed_mask = self._grud_mask_arrays[stay_id].copy()
+        sequence = self._grud_sequence_arrays[stay_id]
+        elapsed_time = _grud_elapsed_time(sequence, observed_mask)
+        labels = self._label_arrays[stay_id].copy()
+        return _grud_pad_item(
+            values,
+            observed_mask,
+            elapsed_time,
+            self._grud_static_arrays[stay_id].copy(),
+            labels,
+            self.maxlen,
+        )
+
+
 @gin.configurable("CommonPandasDataset")
 class CommonPandasDataset(Dataset):
     """Common dataset: subclass of Torch Dataset that represents the data to learn on.
@@ -379,6 +551,76 @@ class PredictionPandasDataset(CommonPandasDataset):
 
     def to_tensor(self) -> tuple[Tensor, Tensor, Tensor]:
         return tuple(from_numpy(value) for value in self.get_data_and_labels())
+
+
+@gin.configurable("GRUDPredictionPandasDataset")
+class GRUDPredictionPandasDataset(PredictionPandasDataset):
+    """Pandas equivalent of :class:`GRUDPredictionPolarsDataset`."""
+
+    def ram_cache(self, cache: bool = True):
+        self._cached_dataset = None
+        if cache and hasattr(self, "_grud_dynamic_arrays"):
+            logging.info(f"Caching {self.split} GRU-D dataset in ram.")
+            self._cached_dataset = [self[i] for i in range(len(self))]
+
+    def __init__(self, *args, reference_means: Optional[np.ndarray] = None, ram_cache: bool = True, **kwargs):
+        data = args[0] if args else kwargs["data"]
+        super().__init__(*args, ram_cache=False, **kwargs)
+        raw_features = data[self.split][DataSegment.features].sort_values(
+            [self.vars["GROUP"], self.vars["SEQUENCE"]]
+        )
+        dynamic, indicators, static = _grud_validate_columns(raw_features, self.vars)
+        self._grud_dynamic_names = dynamic
+        self._grud_indicator_names = indicators
+        self._grud_static_names = static
+        self._grud_dynamic_arrays = {}
+        self._grud_mask_arrays = {}
+        self._grud_static_arrays = {}
+        self._grud_sequence_arrays = {}
+        self._grud_label_arrays = {}
+        self._grud_stay_order = list(self.outcome_df.index.unique())
+        group = self.vars["GROUP"]
+        label = self.vars["LABEL"]
+        outcome = data[self.split][DataSegment.outcome]
+        for stay_id, part in raw_features.groupby(group, sort=False):
+            self._grud_dynamic_arrays[stay_id] = part[dynamic].to_numpy(dtype=np.float32)
+            self._grud_mask_arrays[stay_id] = 1.0 - part[indicators].to_numpy(dtype=np.float32)
+            self._grud_static_arrays[stay_id] = (
+                part[static].iloc[0].to_numpy(dtype=np.float32) if static else np.zeros(0, dtype=np.float32)
+            )
+            self._grud_sequence_arrays[stay_id] = part[self.vars["SEQUENCE"]].to_numpy()
+            self._grud_label_arrays[stay_id] = outcome.loc[outcome[group] == stay_id, label].to_numpy(dtype=np.float32)
+
+        self.reference_means = (
+            np.asarray(reference_means, dtype=np.float32).copy()
+            if reference_means is not None
+            else _grud_reference_means(data[DataSplit.train][DataSegment.features], self.vars)
+        )
+        if self.reference_means.shape != (len(dynamic),):
+            raise ValueError(f"Expected {len(dynamic)} GRU-D reference means, got shape {self.reference_means.shape}.")
+        self.ram_cache(ram_cache)
+
+    def get_reference_means(self) -> np.ndarray:
+        return self.reference_means.copy()
+
+    def _build_item(self, idx: int) -> tuple[list[Tensor], Tensor, Tensor]:
+        stay_id = self._grud_stay_order[idx]
+        values = self._grud_dynamic_arrays[stay_id].copy()
+        observed_mask = self._grud_mask_arrays[stay_id].copy()
+        elapsed_time = _grud_elapsed_time(self._grud_sequence_arrays[stay_id], observed_mask)
+        return _grud_pad_item(
+            values,
+            observed_mask,
+            elapsed_time,
+            self._grud_static_arrays[stay_id].copy(),
+            self._grud_label_arrays[stay_id].copy(),
+            self.maxlen,
+        )
+
+    def __getitem__(self, idx: int) -> tuple[list[Tensor], Tensor, Tensor]:
+        if self._cached_dataset is not None:
+            return self._cached_dataset[idx]
+        return self._build_item(idx)
 
 
 @gin.configurable("ImputationPandasDataset")

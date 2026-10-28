@@ -1,0 +1,18 @@
+# Settings for the YAIB-native GRU-D prediction model.
+# Example:
+# uv run icu-benchmarks train -d demo_data/mortality24/mimic_demo -n mimic_demo \
+#   -t BinaryClassification -tn Mortality24 -m GRUD --cpu --tune -l ../yaib_logs/
+
+include "configs/prediction_models/common/DLCommon.gin"
+
+train_common.model = @GRUDNet
+
+optimizer/hyperparameter.class_to_tune = @Adam
+optimizer/hyperparameter.weight_decay = 1e-6
+optimizer/hyperparameter.lr = (1e-6, 1e-4, "log")
+
+model/hyperparameter.class_to_tune = @GRUDNet
+model/hyperparameter.num_classes = %NUM_CLASSES
+model/hyperparameter.hidden_dim = (32, 512, "log")
+model/hyperparameter.layer_dim = (1, 4)
+model/hyperparameter.dropout = (0.0, 0.4)

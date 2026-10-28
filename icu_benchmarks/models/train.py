@@ -117,13 +117,27 @@ def train_common(
         RunMode.classification: PredictionPolarsDataset if polars else PredictionPandasDataset,
         RunMode.regression: PredictionPolarsDataset if polars else PredictionPandasDataset,
     }
-    dataset_class = dataset_classes[mode]
+    model_dataset_classes = getattr(model, "prediction_dataset_classes", None)
+    if model_dataset_classes is not None and mode != RunMode.imputation:
+        dataset_class = model_dataset_classes["polars" if polars else "pandas"]
+    else:
+        dataset_class = dataset_classes[mode]
 
     logging.info(f"Using dataset class: {dataset_class.__name__}.")
     logging.info(f"Logging to directory: {log_dir}.")
     save_config_file(log_dir)  # We save the operative config before and also after training
     train_dataset = dataset_class(data, split=DataSplit.train, ram_cache=ram_cache, name=dataset_names.get("train", "default"))
-    val_dataset = dataset_class(data, split=DataSplit.val, ram_cache=ram_cache, name=dataset_names.get("val", "default"))
+    reference_means = (
+        train_dataset.get_reference_means() if hasattr(train_dataset, "get_reference_means") else None
+    )
+    split_kwargs = {"reference_means": reference_means} if reference_means is not None else {}
+    val_dataset = dataset_class(
+        data,
+        split=DataSplit.val,
+        ram_cache=ram_cache,
+        name=dataset_names.get("val", "default"),
+        **split_kwargs,
+    )
     train_dataset, val_dataset = (
         assure_minimum_length(train_dataset),
         assure_minimum_length(val_dataset),
@@ -155,20 +169,24 @@ def train_common(
         pin_memory=not cpu,
     )
 
-    data_shape = next(iter(train_loader))[0].shape
+    sample_data = next(iter(train_loader))[0]
+    data_shape = tuple(value.shape for value in sample_data) if isinstance(sample_data, (list, tuple)) else sample_data.shape
 
     if load_weights:
         model: DLModel | MLModelClassifier | MLModelRegression = load_model(model, source_dir, pl_model=pl_model, mode=mode)
         if mode == RunMode.regression and model.target_transform != target_transform:
             raise ValueError("Model and preprocessing target transforms do not match.")
     else:
-        model: DLModel | MLModelClassifier | MLModelRegression = model(
+        model_kwargs = dict(
             optimizer=optimizer,
             input_size=data_shape,
             epochs=epochs,
             run_mode=mode,
             cpu=cpu,
         )
+        if reference_means is not None:
+            model_kwargs["reference_means"] = reference_means
+        model: DLModel | MLModelClassifier | MLModelRegression = model(**model_kwargs)
 
     model.target_transform = target_transform
     if target_transform is not None:
@@ -227,7 +245,13 @@ def train_common(
         logging.info("Finished training full model.")
         save_config_file(log_dir)
         return 0
-    test_dataset = dataset_class(data, split=test_on, name=dataset_names.get("test", "default"), ram_cache=ram_cache)
+    test_dataset = dataset_class(
+        data,
+        split=test_on,
+        name=dataset_names.get("test", "default"),
+        ram_cache=ram_cache,
+        **split_kwargs,
+    )
     test_dataset = assure_minimum_length(test_dataset)
     logging.info(f"Testing on {test_dataset.name}  with {len(test_dataset)} samples.")
     test_loader = (
