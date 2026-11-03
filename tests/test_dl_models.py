@@ -157,14 +157,7 @@ def test_train_common_one_epoch(model_cls, tmp_path):
     [
         GRUNet,
         TemporalConvNet,
-        pytest.param(
-            Transformer,
-            marks=pytest.mark.xfail(
-                strict=True,
-                raises=TypeError,
-                reason="#259: BaseTransformer does not pass input_size to the wrapper, so it is missing from the checkpoint",
-            ),
-        ),
+        Transformer,
     ],
 )
 def test_reload_reproduces_test_predictions(model_cls, tmp_path):

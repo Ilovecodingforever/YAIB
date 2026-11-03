@@ -31,7 +31,9 @@ class BaseTransformer(DLPredictionWrapper):
         *args,
         **kwargs,
     ):
-        super().__init__(*args, **kwargs)
+        # Keep the feature shape in Lightning's hyperparameters so checkpoints
+        # can reconstruct the Transformer during evaluation.
+        super().__init__(input_size=input_size, *args, **kwargs)
         if local_context is not None and self._get_name() == "Transformer":
             raise ValueError("Local context is only supported for LocalTransformer")
         hidden = hidden if hidden % 2 == 0 else hidden + 1  # Make sure hidden is even

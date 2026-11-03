@@ -173,7 +173,13 @@ def train_common(
     data_shape = tuple(value.shape for value in sample_data) if isinstance(sample_data, (list, tuple)) else sample_data.shape
 
     if load_weights:
-        model: DLModel | MLModelClassifier | MLModelRegression = load_model(model, source_dir, pl_model=pl_model, mode=mode)
+        model: DLModel | MLModelClassifier | MLModelRegression = load_model(
+            model,
+            source_dir,
+            pl_model=pl_model,
+            mode=mode,
+            input_size=data_shape,
+        )
         if mode == RunMode.regression and model.target_transform != target_transform:
             raise ValueError("Model and preprocessing target transforms do not match.")
     else:
@@ -309,7 +315,7 @@ def persist_shap_data(trainer: Trainer, log_dir: Path):
             logging.error(f"Failed to save {split} shap values: {e}")
 
 
-def load_model(model, source_dir, pl_model=True, *, mode) -> DLModel | MLModelClassifier | MLModelRegression:
+def load_model(model, source_dir, pl_model=True, *, mode, input_size=None) -> DLModel | MLModelClassifier | MLModelRegression:
     # The run mode decides whether a legacy artifact without a target transform may be loaded.
     try:
         mode = RunMode(mode)
@@ -327,7 +333,10 @@ def load_model(model, source_dir, pl_model=True, *, mode) -> DLModel | MLModelCl
                 raise Exception(f"No weights to load at path : {source_dir}")
             # YAIB checkpoints store the selected model class and RunMode enum.
             with torch.serialization.safe_globals([model, RunMode]):
-                model = model.load_from_checkpoint(model_path)
+                # Older Transformer checkpoints may lack input_size; the current
+                # dataset shape is already available at the call site.
+                checkpoint_kwargs = {} if input_size is None else {"input_size": input_size}
+                model = model.load_from_checkpoint(model_path, **checkpoint_kwargs)
         else:
             model_path = source_dir / "model.joblib"
             if not model_path.exists():
