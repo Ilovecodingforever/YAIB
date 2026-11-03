@@ -299,7 +299,7 @@ The benchmark provides (among others) the following built-in models:
 - [Temporal Convolutional Networks (TCN)](https://arxiv.org/pdf/1803.01271): 1D convolution approach to sequence data. By using dilated convolution to extend the receptive field of the network it has shown great performance on long-term dependencies.
 - [Transformers](https://papers.nips.cc/paper/2017/file/3f5ee243547dee91fbd053c1c4a845aa-Paper.pdf): The most common attention-based approach.
 
-# 🛠️ Development
+# 🛠️ Developmen
 
 To adapt YAIB to your own use case, you can use the [development information](https://github.com/rvandewater/YAIB/wiki/Contribution-and-development) page as a reference.
 We appreciate contributions to the project. Please read the [contribution guidelines](CONTRIBUTING.md) before submitting a pull request.
