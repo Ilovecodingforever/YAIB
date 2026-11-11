@@ -12,6 +12,14 @@ from icu_benchmarks.data.split_process_data import preprocess_data
 from icu_benchmarks.data.target_transform import TargetTransform
 from icu_benchmarks.models.train import train_common
 from icu_benchmarks.models.utils import JsonResultLoggingEncoder
+from icu_benchmarks.paired_inference import (
+    PAIRED_FOLDS,
+    PAIRED_REPETITIONS,
+    checkpoint_file,
+    fold_result_is_valid,
+    source_run_from_dir,
+    validate_source_run,
+)
 from icu_benchmarks.run_utils import aggregate_results, log_full_line
 from icu_benchmarks.wandb_utils import wandb_log
 
@@ -40,6 +48,7 @@ def execute_repeated_cv(
     verbose: bool = False,
     wandb: bool = False,
     complete_train: bool = False,
+    paired_fold_eval: bool = False,
 ) -> float:
     """Preprocesses data and trains a model for each fold.
 
@@ -70,9 +79,18 @@ def execute_repeated_cv(
     Returns:
         The average native-unit MSE for regression, or loss for other run modes.
     """
-    if not cv_repetitions_to_train:
+    if paired_fold_eval:
+        if not eval_only or not load_weights or complete_train:
+            raise ValueError("paired fold evaluation requires evaluation with loaded weights")
+        if cv_repetitions != PAIRED_REPETITIONS or cv_folds != PAIRED_FOLDS:
+            raise ValueError("paired fold evaluation requires cv_repetitions=5 and cv_folds=5")
+        source_run_from_dir(source_dir)
+        validate_source_run(source_dir)
+        cv_repetitions_to_train = PAIRED_REPETITIONS
+        cv_folds_to_train = PAIRED_FOLDS
+    elif not cv_repetitions_to_train:
         cv_repetitions_to_train = cv_repetitions
-    if not cv_folds_to_train:
+    if not paired_fold_eval and not cv_folds_to_train:
         cv_folds_to_train = cv_folds
     source_transform = TargetTransform.load(source_dir) if load_weights and mode == RunMode.regression else None
     agg_loss = 0
@@ -89,7 +107,15 @@ def execute_repeated_cv(
         # Train model for each fold configuration (i.e, one fold is test fold and the rest are train/val folds)
         for fold_index in range(cv_folds_to_train):
             repetition_fold_dir = log_dir / f"repetition_{repetition}" / f"fold_{fold_index}"
+            if paired_fold_eval and fold_result_is_valid(repetition_fold_dir):
+                logging.info(f"Skipping completed paired fold {repetition}/" f"{fold_index}.")
+                continue
             repetition_fold_dir.mkdir(parents=True, exist_ok=True)
+
+            paired_source_dir = source_dir
+            if paired_fold_eval:
+                paired_source_dir = source_dir.parent.parent / f"repetition_{repetition}" / f"fold_{fold_index}"
+                checkpoint_file(paired_source_dir)
 
             start_time = datetime.now()
             data, target_transform = preprocess_data(
@@ -115,7 +141,7 @@ def execute_repeated_cv(
                 log_dir=repetition_fold_dir,
                 eval_only=eval_only,
                 load_weights=load_weights,
-                source_dir=source_dir,
+                source_dir=paired_source_dir,
                 reproducible=reproducible,
                 test_on=test_on,
                 mode=mode,

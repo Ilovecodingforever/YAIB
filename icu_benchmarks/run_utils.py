@@ -109,6 +109,27 @@ def build_parser() -> ArgumentParser:
     parser.add_argument("--hp-checkpoint", type=Path, help="Use previous hyperparameter checkpoint.")
     parser.add_argument("--eval", default=False, action=BOA, help="Only evaluate model, skip training.")
     parser.add_argument(
+        "--paired-fold-eval",
+        default=False,
+        action=BOA,
+        help="Evaluate matching source checkpoints over all five repetitions and folds (requires --eval).",
+    )
+    parser.add_argument(
+        "--paired-source-seed",
+        type=int,
+        help="Verified seed used to create the source training splits (required for paired evaluation).",
+    )
+    parser.add_argument(
+        "--paired-source-data-dir",
+        type=Path,
+        help="Processed source outcome-data directory used for paired alignment checks.",
+    )
+    parser.add_argument(
+        "--paired-run-dir",
+        type=Path,
+        help="Existing or new paired output directory, used for safe resume.",
+    )
+    parser.add_argument(
         "--complete-train",
         default=False,
         action=BOA,
@@ -147,8 +168,28 @@ def build_parser() -> ArgumentParser:
 
 def parse_args(args: Sequence[str]) -> Namespace:
     """Parses the command line, rejecting unknown arguments; the evaluate command is the same as --eval."""
-    parsed = build_parser().parse_args(args)
+    parser = build_parser()
+    parsed = parser.parse_args(args)
     parsed.eval = parsed.eval or parsed.command == "evaluate"
+    paired_options_used = any(
+        value is not None
+        for value in (parsed.paired_source_seed, parsed.paired_source_data_dir, parsed.paired_run_dir)
+    )
+    if parsed.paired_fold_eval:
+        if not parsed.eval:
+            parser.error("--paired-fold-eval requires --eval or the evaluate command")
+        if parsed.fine_tune is not None or parsed.complete_train or parsed.samples is not None:
+            parser.error("--paired-fold-eval cannot be combined with fine-tuning, complete training, or --samples")
+        if parsed.source_dir is None or parsed.source_name is None:
+            parser.error("paired evaluation requires --source-dir and --source-name")
+        if parsed.paired_source_seed is None:
+            parser.error("paired evaluation requires --paired-source-seed")
+        if parsed.seed != parsed.paired_source_seed:
+            parser.error("--seed must equal --paired-source-seed for paired evaluation")
+        if parsed.paired_source_data_dir is None:
+            parser.error("paired evaluation requires --paired-source-data-dir")
+    elif paired_options_used:
+        parser.error("paired evaluation options require --paired-fold-eval")
     return parsed
 
 

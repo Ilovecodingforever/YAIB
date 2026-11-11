@@ -7,6 +7,7 @@ __pycache__/
 *.so
 
 .conda
+miiv_15min
 
 # Distribution / packaging
 .Python

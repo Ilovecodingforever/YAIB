@@ -14,6 +14,14 @@ from icu_benchmarks.wandb_utils import (
 from icu_benchmarks.tuning.hyperparameters import choose_and_bind_hyperparameters_optuna
 from scripts.plotting.utils import plot_aggregated_results
 from icu_benchmarks.cross_validation import execute_repeated_cv
+from icu_benchmarks.paired_inference import (
+    prepare_paired_run,
+    resolve_gin_value,
+    validate_alignment,
+    validate_completed_paired_run,
+    validate_source_run,
+    mark_paired_complete,
+)
 from icu_benchmarks.run_utils import (
     parse_args,
     create_run_dir,
@@ -55,6 +63,7 @@ def main(my_args=tuple(sys.argv[1:])):
     evaluate = args.eval
     experiment = args.experiment
     source_dir = args.source_dir
+    paired_fold_eval = args.paired_fold_eval
     modalities = args.modalities
     if modalities:
         logging.debug(f"Binding modalities: {modalities}")
@@ -126,10 +135,37 @@ def main(my_args=tuple(sys.argv[1:])):
         if args.fine_tune:
             log_dir /= f"fine_tune_{args.fine_tune}"
             name_datasets(args.name, args.name, args.name)
-        run_dir = create_run_dir(log_dir)
         source_dir = args.source_dir
         logging.info(f"Will load weights from {source_dir} and bind train gin-config. Note: this might override your config.")
         gin.parse_config_file(source_dir / "train_config.gin")
+        if paired_fold_eval:
+            source_run, source_checkpoints = validate_source_run(source_dir)
+            file_names = resolve_gin_value(gin.query_parameter("preprocess.file_names"))
+            vars = resolve_gin_value(gin.query_parameter("preprocess.vars"))
+            validate_alignment(
+                args.paired_source_data_dir,
+                data_dir,
+                str(args.source_name),
+                str(name),
+                args.paired_source_seed,
+                file_names,
+                vars,
+            )
+            paired_parent = log_dir / "paired_5x5" / source_run.name
+            run_dir = args.paired_run_dir or paired_parent
+            prepare_paired_run(
+                run_dir,
+                source_run,
+                source_checkpoints,
+                str(args.source_name),
+                str(name),
+                model,
+                args.paired_source_seed,
+                args.paired_source_data_dir,
+                data_dir,
+            )
+        else:
+            run_dir = create_run_dir(log_dir)
     elif args.samples and args.source_dir is not None:  # Train model with limited samples and bind existing config
         logging.info("Binding train gin-config. Note: this might override your config.")
         gin.parse_config_file(args.source_dir / "train_config.gin")
@@ -193,14 +229,21 @@ def main(my_args=tuple(sys.argv[1:])):
         cpu=args.cpu,
         wandb=args.wandb_sweep,
         complete_train=args.complete_train,
+        paired_fold_eval=paired_fold_eval,
     )
 
     log_full_line("FINISHED TRAINING", level=logging.INFO, char="=", num_newlines=3)
     execution_time = datetime.now() - start_time
     log_full_line(f"DURATION: {execution_time}", level=logging.INFO, char="")
     try:
+        if paired_fold_eval:
+            validate_completed_paired_run(run_dir)
         aggregate_results(run_dir, execution_time)
+        if paired_fold_eval:
+            mark_paired_complete(run_dir)
     except Exception as e:
+        if paired_fold_eval:
+            raise
         logging.error(f"Failed to aggregate results: {e}")
         logging.debug("Error details:", exc_info=True)
     if args.plot:

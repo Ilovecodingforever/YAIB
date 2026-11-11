@@ -1,101 +1,148 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Existing-checkpoint evaluation only. Run with DRY_RUN=0 to execute.
-# By default, generates only missing LSTM configurations; set MODELS="LSTM GRUD Transformer" for all.
+# Canonical paired 5x5 inference workflow. No inference is launched by default.
 DRY_RUN="${DRY_RUN:-1}"
-YAIB_ENV="/home/mingzhul/projects/Simultaneous-EHR/repos/YAIB/.conda/yaib"
+MODELS="${MODELS:-LSTM}"
+SOURCE_DATASETS="${SOURCE_DATASETS:-hirid hirid_15min hirid_5min miiv miiv_15min miiv_5min}"
+TARGET_DATASETS="${TARGET_DATASETS:-hirid hirid_15min hirid_5min miiv miiv_15min miiv_5min}"
+INCLUDE_MATCHED="${INCLUDE_MATCHED:-1}"
+ONLY="${ONLY:-}" # source:model:target, for one selected configuration
+SEED="${SEED:-}"
+YAIB_ENV="${YAIB_ENV:-/home/mingzhul/projects/Simultaneous-EHR/repos/YAIB/.conda/yaib}"
 YAIB_CLI="$YAIB_ENV/bin/icu-benchmarks"
-export PATH="$YAIB_ENV/bin:$PATH"
+ROOT="${ROOT:-/heinz-georgenas/users/mingzhul/Simultaneous-EHR/yaib}"
+LOGS="${LOGS:-$ROOT/logs}"
+DATA_ROOT="${DATA_ROOT:-$ROOT/data/mortality24}"
+PAIRED_LOGS="${PAIRED_LOGS:-$ROOT/logs_paired_5x5}"
+TASK="${TASK:-Mortality24}"
+
 if [[ "$DRY_RUN" != "1" && ! -x "$YAIB_CLI" ]]; then
   echo "ERROR: icu-benchmarks not found or not executable: $YAIB_CLI" >&2
-  echo "Activate the YAIB environment and verify the installation." >&2
   exit 1
 fi
-MODELS=" ${MODELS:-LSTM} "
-ROOT="/heinz-georgenas/users/mingzhul/Simultaneous-EHR/yaib"
-LOGS="$ROOT/logs"
-TASK="Mortality24"
-run_eval() {
-  local model="$1" source="$2" test="$3" run="$4"
-  local checkpoint="$LOGS/$run/repetition_0/fold_0"
-  local datadir="$ROOT/data/mortality24/$test"
-  if [[ "$MODELS" != *" $model "* ]]; then return; fi
-  if [[ ! -f "$checkpoint/train_config.gin" ]]; then
-    echo "SKIP (missing checkpoint config): $checkpoint" >&2; return
-  fi
-  if [[ ! -d "$datadir" ]]; then
-    echo "SKIP (missing test data): $datadir" >&2; return
-  fi
-  local cmd=("$YAIB_CLI" --eval -d "$datadir" -t BinaryClassification -tn "$TASK" -m "$model" -s 0 -l "$LOGS" -sn "$source" -n "$test" --source-dir "$checkpoint")
-  if [[ "$DRY_RUN" == "1" ]]; then printf "%q " "${cmd[@]}"; echo; else "${cmd[@]}"; fi
+if [[ "$DRY_RUN" != "1" && -z "$SEED" ]]; then
+  echo "ERROR: set SEED to the verified seed used by the selected source training run." >&2
+  exit 1
+fi
+contains() {
+  local haystack=" $1 " needle=" $2 "
+  [[ "$haystack" == *"$needle"* ]]
 }
-run_eval GRUD hirid hirid_15min "hirid/Mortality24/GRUD/2026-10-29T13-30-50"
-run_eval GRUD hirid hirid_5min "hirid/Mortality24/GRUD/2026-10-29T13-30-50"
-run_eval GRUD hirid miiv_15min "hirid/Mortality24/GRUD/2026-10-29T13-30-50"
-run_eval GRUD hirid miiv_5min "hirid/Mortality24/GRUD/2026-10-29T13-30-50"
-run_eval LSTM hirid hirid_15min "hirid/Mortality24/LSTM/2026-10-26T16-38-10"
-run_eval LSTM hirid hirid_5min "hirid/Mortality24/LSTM/2026-10-26T16-38-10"
-run_eval LSTM hirid miiv_15min "hirid/Mortality24/LSTM/2026-10-26T16-38-10"
-run_eval LSTM hirid miiv_5min "hirid/Mortality24/LSTM/2026-10-26T16-38-10"
-run_eval Transformer hirid hirid_15min "hirid/Mortality24/Transformer/2026-11-02T15-58-10"
-run_eval Transformer hirid hirid_5min "hirid/Mortality24/Transformer/2026-11-02T15-58-10"
-run_eval Transformer hirid miiv "hirid/Mortality24/Transformer/2026-11-02T15-58-10"
-run_eval Transformer hirid miiv_15min "hirid/Mortality24/Transformer/2026-11-02T15-58-10"
-run_eval Transformer hirid miiv_5min "hirid/Mortality24/Transformer/2026-11-02T15-58-10"
-run_eval GRUD hirid_15min hirid_5min "hirid_15min/Mortality24/GRUD/2026-10-31T11-17-17"
-run_eval GRUD hirid_15min miiv_15min "hirid_15min/Mortality24/GRUD/2026-10-31T11-17-17"
-run_eval GRUD hirid_15min miiv_5min "hirid_15min/Mortality24/GRUD/2026-10-31T11-17-17"
-run_eval LSTM hirid_15min hirid_5min "hirid_15min/Mortality24/LSTM/2026-10-27T11-43-55"
-run_eval LSTM hirid_15min miiv_15min "hirid_15min/Mortality24/LSTM/2026-10-27T11-43-55"
-run_eval LSTM hirid_15min miiv_5min "hirid_15min/Mortality24/LSTM/2026-10-27T11-43-55"
-run_eval Transformer hirid_15min hirid_5min "hirid_15min/Mortality24/Transformer/2026-10-28T12-33-17"
-run_eval Transformer hirid_15min miiv "hirid_15min/Mortality24/Transformer/2026-10-28T12-33-17"
-run_eval Transformer hirid_15min miiv_15min "hirid_15min/Mortality24/Transformer/2026-10-28T12-33-17"
-run_eval Transformer hirid_15min miiv_5min "hirid_15min/Mortality24/Transformer/2026-10-28T12-33-17"
-run_eval GRUD hirid_5min hirid "hirid_5min/Mortality24/GRUD/2026-10-28T19-21-50"
-run_eval GRUD hirid_5min hirid_15min "hirid_5min/Mortality24/GRUD/2026-10-28T19-21-50"
-run_eval GRUD hirid_5min miiv "hirid_5min/Mortality24/GRUD/2026-10-28T19-21-50"
-run_eval GRUD hirid_5min miiv_15min "hirid_5min/Mortality24/GRUD/2026-10-28T19-21-50"
-run_eval GRUD hirid_5min miiv_5min "hirid_5min/Mortality24/GRUD/2026-10-28T19-21-50"
-run_eval LSTM hirid_5min hirid_15min "hirid_5min/Mortality24/LSTM/2026-10-27T11-39-46"
-run_eval LSTM hirid_5min miiv_15min "hirid_5min/Mortality24/LSTM/2026-10-27T11-39-46"
-run_eval LSTM hirid_5min miiv_5min "hirid_5min/Mortality24/LSTM/2026-10-27T11-39-46"
-run_eval Transformer hirid_5min hirid_15min "hirid_5min/Mortality24/Transformer/2026-11-03T12-41-33"
-run_eval Transformer hirid_5min miiv "hirid_5min/Mortality24/Transformer/2026-11-03T12-41-33"
-run_eval Transformer hirid_5min miiv_15min "hirid_5min/Mortality24/Transformer/2026-11-03T12-41-33"
-run_eval Transformer hirid_5min miiv_5min "hirid_5min/Mortality24/Transformer/2026-11-03T12-41-33"
-run_eval LSTM miiv hirid "miiv/Mortality24/LSTM/2026-10-26T16-39-18"
-run_eval LSTM miiv hirid_15min "miiv/Mortality24/LSTM/2026-10-26T16-39-18"
-run_eval LSTM miiv hirid_5min "miiv/Mortality24/LSTM/2026-10-26T16-39-18"
-run_eval LSTM miiv miiv_15min "miiv/Mortality24/LSTM/2026-10-26T16-39-18"
-run_eval LSTM miiv miiv_5min "miiv/Mortality24/LSTM/2026-10-26T16-39-18"
-run_eval Transformer miiv hirid "miiv/Mortality24/Transformer/2026-11-02T00-27-19"
-run_eval Transformer miiv hirid_15min "miiv/Mortality24/Transformer/2026-11-02T00-27-19"
-run_eval Transformer miiv hirid_5min "miiv/Mortality24/Transformer/2026-11-02T00-27-19"
-run_eval Transformer miiv miiv_15min "miiv/Mortality24/Transformer/2026-11-02T00-27-19"
-run_eval Transformer miiv miiv_5min "miiv/Mortality24/Transformer/2026-11-02T00-27-19"
-run_eval LSTM miiv_15min hirid "miiv_15min/Mortality24/LSTM/2026-11-04T00-49-11"
-run_eval LSTM miiv_15min hirid_15min "miiv_15min/Mortality24/LSTM/2026-11-04T00-49-11"
-run_eval LSTM miiv_15min hirid_5min "miiv_15min/Mortality24/LSTM/2026-11-04T00-49-11"
-run_eval LSTM miiv_15min miiv "miiv_15min/Mortality24/LSTM/2026-11-04T00-49-11"
-run_eval LSTM miiv_15min miiv_5min "miiv_15min/Mortality24/LSTM/2026-11-04T00-49-11"
-run_eval LSTM miiv_5min hirid "miiv_5min/Mortality24/LSTM/2026-11-05T00-24-44"
-run_eval LSTM miiv_5min hirid_15min "miiv_5min/Mortality24/LSTM/2026-11-05T00-24-44"
-run_eval LSTM miiv_5min hirid_5min "miiv_5min/Mortality24/LSTM/2026-11-05T00-24-44"
-run_eval LSTM miiv_5min miiv "miiv_5min/Mortality24/LSTM/2026-11-05T00-24-44"
-run_eval LSTM miiv_5min miiv_15min "miiv_5min/Mortality24/LSTM/2026-11-05T00-24-44"
-run_eval GRUD hirid miiv "hirid/Mortality24/GRUD/2026-10-29T13-30-50"
-run_eval LSTM hirid miiv "hirid/Mortality24/LSTM/2026-10-26T16-38-10"
-run_eval GRUD hirid_15min hirid "hirid_15min/Mortality24/GRUD/2026-10-31T11-17-17"
-run_eval GRUD hirid_15min miiv "hirid_15min/Mortality24/GRUD/2026-10-31T11-17-17"
-run_eval LSTM hirid_15min hirid "hirid_15min/Mortality24/LSTM/2026-10-27T11-43-55"
-run_eval LSTM hirid_15min miiv "hirid_15min/Mortality24/LSTM/2026-10-27T11-43-55"
-run_eval Transformer hirid_15min hirid "hirid_15min/Mortality24/Transformer/2026-10-28T12-33-17"
-run_eval LSTM hirid_5min hirid "hirid_5min/Mortality24/LSTM/2026-10-27T11-39-46"
-run_eval LSTM hirid_5min miiv "hirid_5min/Mortality24/LSTM/2026-10-27T11-39-46"
-run_eval Transformer hirid_5min hirid "hirid_5min/Mortality24/Transformer/2026-11-03T12-41-33"
-run_eval GRUD miiv hirid "miiv/Mortality24/GRUD/2026-11-03T14-14-31"
-run_eval GRUD miiv hirid_15min "miiv/Mortality24/GRUD/2026-11-03T14-14-31"
-run_eval GRUD miiv hirid_5min "miiv/Mortality24/GRUD/2026-11-03T14-14-31"
-run_eval GRUD miiv miiv_15min "miiv/Mortality24/GRUD/2026-11-03T14-14-31"
-run_eval GRUD miiv miiv_5min "miiv/Mortality24/GRUD/2026-11-03T14-14-31"
+
+has_checkpoint() {
+  local fold_dir="$1" candidate
+  for candidate in model.ckpt model-v1.ckpt last.ckpt model.joblib last.joblib; do
+    [[ -f "$fold_dir/$candidate" ]] && return 0
+  done
+  return 1
+}
+
+complete_source_run() {
+  local run_dir="$1" repetition fold
+  for repetition in 0 1 2 3 4; do
+    for fold in 0 1 2 3 4; do
+      [[ -f "$run_dir/repetition_$repetition/fold_$fold/train_config.gin" ]] || return 1
+      has_checkpoint "$run_dir/repetition_$repetition/fold_$fold" || return 1
+    done
+  done
+}
+
+latest_source_run() {
+  local source="$1" model="$2" base="$LOGS/$source/$TASK/$model"
+  local run_dir run_name selected="" saw_selected=0
+  [[ -d "$base" ]] || return 0
+  while IFS= read -r run_dir; do
+    run_name="$(basename "$run_dir")"
+    [[ "$run_name" == tmp* ]] && continue
+    if complete_source_run "$run_dir"; then
+      selected="$run_dir"
+      saw_selected=1
+    elif [[ "$saw_selected" == "1" ]]; then
+      echo "NOTICE: newer incomplete source run ignored: $run_dir" >&2
+    else
+      echo "NOTICE: incomplete source run ignored: $run_dir" >&2
+    fi
+  done < <(find "$base" -mindepth 1 -maxdepth 1 -type d -print | sort)
+  if [[ -n "$selected" ]]; then
+    printf '%s\n' "$selected"
+  fi
+  return 0
+}
+
+paired_output_is_complete() {
+  local output="$1" source_run="$2" source="$3" target="$4" model="$5"
+  local metadata="$output/paired_eval_metadata.json"
+  [[ -f "$metadata" ]] || return 1
+  grep -Fq '"protocol": "paired_5x5"' "$metadata" || return 1
+  grep -Fq "\"source_training_run\": \"$(readlink -f "$source_run")\"" "$metadata" || return 1
+  grep -Fq "\"source_dataset\": \"$source\"" "$metadata" || return 1
+  grep -Fq "\"target_dataset\": \"$target\"" "$metadata" || return 1
+  grep -Fq "\"model\": \"$model\"" "$metadata" || return 1
+  grep -Fq '"status": "complete"' "$metadata" || return 1
+  [[ "$(find "$output" -path '*/repetition_*/fold_*/test_metrics.json' -type f | wc -l)" -eq 25 ]]
+}
+
+run_eval() {
+  local model="$1" source="$2" target="$3" source_run="$4"
+  local source_data="$DATA_ROOT/$source" target_data="$DATA_ROOT/$target"
+  local checkpoint="$source_run/repetition_0/fold_0"
+  local output="$PAIRED_LOGS/$target/$TASK/$model/_from_$source/paired_5x5/$(basename "$source_run")"
+  local seed_arg="${SEED:-<verified-source-seed>}"
+  local cmd
+
+  contains "$MODELS" "$model" || return 0
+  contains "$SOURCE_DATASETS" "$source" || return 0
+  contains "$TARGET_DATASETS" "$target" || return 0
+  [[ "$INCLUDE_MATCHED" == "1" || "$source" != "$target" ]] || return 0
+  [[ -z "$ONLY" || "$ONLY" == "$source:$model:$target" ]] || return 0
+
+  if [[ ! -d "$source_data" || ! -d "$target_data" ]]; then
+    echo "SKIP: missing processed data for $source -> $target" >&2
+    return 0
+  fi
+  if paired_output_is_complete "$output" "$source_run" "$source" "$target" "$model"; then
+    echo "SKIP: completed paired run $source | $model | $target"
+    return 0
+  fi
+
+  cmd=("$YAIB_CLI" --eval --paired-fold-eval
+    -d "$target_data" -t BinaryClassification -tn "$TASK" -m "$model"
+    -s "$seed_arg" --paired-source-seed "$seed_arg"
+    -l "$PAIRED_LOGS" -sn "$source" -n "$target"
+    --source-dir "$checkpoint" --paired-source-data-dir "$source_data"
+    --paired-run-dir "$output")
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf 'DRY RUN: '
+    printf '%q ' "${cmd[@]}"
+    printf '\n'
+  else
+    echo "EVAL: $source | $model | $target | source_run=$(basename "$source_run") | seed=$SEED"
+    "${cmd[@]}"
+  fi
+}
+planned=0
+failed=0
+for model in $MODELS; do
+  for source in $SOURCE_DATASETS; do
+    source_run="$(latest_source_run "$source" "$model")"
+    if [[ -z "$source_run" ]]; then
+      echo "SKIP: no completed 25-checkpoint source run for $source/$model" >&2
+      continue
+    fi
+    for target in $TARGET_DATASETS; do
+      if [[ -n "$ONLY" && "$ONLY" != "$source:$model:$target" ]]; then
+        continue
+      fi
+      if run_eval "$model" "$source" "$target" "$source_run"; then
+        planned=$((planned + 1))
+      else
+        echo "FAILED: $source | $model | $target" >&2
+        failed=$((failed + 1))
+      fi
+    done
+  done
+done
+
+echo "SUMMARY: configurations=$planned failures=$failed dry_run=$DRY_RUN"
+[[ "$failed" -eq 0 ]]
