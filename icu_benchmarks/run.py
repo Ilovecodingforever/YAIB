@@ -237,7 +237,9 @@ def main(my_args=tuple(sys.argv[1:])):
     log_full_line(f"DURATION: {execution_time}", level=logging.INFO, char="")
     try:
         if paired_fold_eval:
-            validate_completed_paired_run(run_dir)
+            # Fold validation happens before regeneration; aggregate validation
+            # below confirms the newly written files without rerunning valid folds.
+            validate_completed_paired_run(run_dir, require_aggregates=False)
         aggregate_results(run_dir, execution_time)
         if paired_fold_eval:
             validate_completed_paired_run(run_dir, require_aggregates=True)

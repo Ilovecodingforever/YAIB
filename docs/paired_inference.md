@@ -17,17 +17,28 @@ divided by the square root of the number of results (an SEM-like value), and
 the 25 values are correlated because the five inner folds in each repetition
 share the same outer test partition.
 
+Completion validation also requires exactly those 25 repetition/fold keys in
+the aggregate file, matching AUC/PR values in every fold file, and means/std
+values matching YAIB's aggregation formula within floating-point tolerance. If
+all 25 fold files are already valid but an aggregate is missing or stale, a
+resume regenerates the aggregates without rerunning those folds. A provenance
+mismatch is an error rather than an opportunity to mix results.
+
 Paired mode keeps YAIB's current preprocessing. In particular, preprocessing
 statistics may be fitted using the target training subset during inference;
 this protocol fixes checkpoint-to-test-partition pairing, not source-scaler
 reuse.
 
 The source seed is not present in the current saved Gin or Lightning metadata.
-Provide the independently verified seed explicitly with both `--seed` and
-`--paired-source-seed`; the CLI rejects mismatches.
+Provide the seed assertion explicitly with both `--seed` and
+`--paired-source-seed`; the CLI rejects mismatches. The recorded
+`source_seed_status` is therefore user-supplied and unverified by source
+artifacts, not an automatically recovered seed. The workflow's single `SEED`
+value applies to every selected source run; run separate source subsets when
+their training seeds differ.
 
 The executable examples below use `SEED=0` only as a concrete example. Replace
-it with the verified seed for the selected source run before launching.
+it with the seed asserted for the selected source run before launching.
 
 ## Commands
 

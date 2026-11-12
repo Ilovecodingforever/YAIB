@@ -117,7 +117,10 @@ def build_parser() -> ArgumentParser:
     parser.add_argument(
         "--paired-source-seed",
         type=int,
-        help="Verified seed used to create the source training splits (required for paired evaluation).",
+        help=(
+            "User-supplied seed assertion for the source training splits; current source artifacts do not record "
+            "this seed (required for paired evaluation)."
+        ),
     )
     parser.add_argument(
         "--paired-source-data-dir",

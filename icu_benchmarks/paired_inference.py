@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import json
 import math
 from pathlib import Path
+from statistics import mean, pstdev
 from typing import Any
 
 import gin
@@ -20,6 +21,8 @@ PAIRED_PROTOCOL = "paired_5x5"
 PAIRED_REPETITIONS = 5
 PAIRED_FOLDS = 5
 WEIGHT_FILES = ("model.ckpt", "model-v1.ckpt", "last.ckpt", "model.joblib", "last.joblib")
+METRIC_REL_TOL = 1e-7
+METRIC_ABS_TOL = 1e-9
 
 
 def resolve_gin_value(value: Any) -> Any:
@@ -260,10 +263,13 @@ def prepare_paired_run(
     )
     metadata_path = run_dir / "paired_eval_metadata.json"
     if run_dir.exists() and any(run_dir.iterdir()):
+        # Repair only the old numeric target name when the output path and data
+        # directory identify one target unambiguously.
+        repair_gpu_shadowed_target_metadata(run_dir)
         if not metadata_path.is_file():
             raise ValueError(f"Existing paired output has no provenance metadata: {run_dir}")
-        existing = json.loads(metadata_path.read_text())
-        if {key: existing.get(key) for key in request} != request:
+        existing = _read_json(metadata_path)
+        if not isinstance(existing, dict) or not _metadata_request_matches(existing, request):
             raise ValueError(f"Existing paired output metadata does not match the requested run: {run_dir}")
         return existing
 
@@ -277,17 +283,94 @@ def prepare_paired_run(
     return metadata
 
 
-def validate_completed_paired_run(run_dir: Path, require_aggregates: bool = False) -> None:
+def _expected_fold_keys() -> set[tuple[int, int]]:
+    return {
+        (repetition, fold)
+        for repetition in range(PAIRED_REPETITIONS)
+        for fold in range(PAIRED_FOLDS)
+    }
+
+
+def _fold_metrics(run_dir: Path) -> dict[tuple[int, int], dict[str, Any]]:
+    metrics = {}
+    for repetition, fold in sorted(_expected_fold_keys()):
+        fold_dir = Path(run_dir) / f"repetition_{repetition}" / f"fold_{fold}"
+        result = _read_json(fold_dir / "test_metrics.json")
+        if not _metrics_are_valid(result):
+            raise ValueError(f"Missing or invalid fold metrics: {fold_dir / 'test_metrics.json'}")
+        metrics[(repetition, fold)] = result
+    return metrics
+
+
+def _validate_fold_layout(run_dir: Path) -> None:
+    expected_repetitions = {f"repetition_{repetition}" for repetition in range(PAIRED_REPETITIONS)}
+    actual_repetitions = {path.name for path in Path(run_dir).iterdir() if path.is_dir()}
+    if actual_repetitions != expected_repetitions:
+        raise ValueError(f"Paired output must contain exactly repetitions 0-4 in {run_dir}")
+    for repetition in range(PAIRED_REPETITIONS):
+        repetition_dir = Path(run_dir) / f"repetition_{repetition}"
+        expected_folds = {f"fold_{fold}" for fold in range(PAIRED_FOLDS)}
+        actual_folds = {path.name for path in repetition_dir.iterdir() if path.is_dir()}
+        if actual_folds != expected_folds:
+            raise ValueError(f"Paired output must contain exactly folds 0-4 at repetition {repetition}")
+
+
+def _close(left: Any, right: float) -> bool:
+    return _finite_metric(left) and math.isclose(
+        float(left), right, rel_tol=METRIC_REL_TOL, abs_tol=METRIC_ABS_TOL
+    )
+
+
+def _validate_aggregate_files(run_dir: Path, fold_metrics: dict[tuple[int, int], dict[str, Any]]) -> None:
+    aggregated = _read_json(Path(run_dir) / "aggregated_test_metrics.json")
+    if not isinstance(aggregated, dict):
+        raise ValueError(f"Paired aggregated metrics are not a JSON object in {run_dir}")
+
+    expected_repetitions = {f"repetition_{repetition}" for repetition in range(PAIRED_REPETITIONS)}
+    if set(aggregated) != expected_repetitions:
+        raise ValueError(f"Aggregated metrics must contain exactly repetitions 0-4 in {run_dir}")
+    for repetition in range(PAIRED_REPETITIONS):
+        folds = aggregated[f"repetition_{repetition}"]
+        expected_folds = {f"fold_{fold}" for fold in range(PAIRED_FOLDS)}
+        if not isinstance(folds, dict) or set(folds) != expected_folds:
+            raise ValueError(f"Aggregated metrics must contain exactly folds 0-4 at repetition {repetition}")
+        for fold in range(PAIRED_FOLDS):
+            entry = folds[f"fold_{fold}"]
+            expected = fold_metrics[(repetition, fold)]
+            if not isinstance(entry, dict) or not _close(entry.get("AUC"), float(expected["AUC"])):
+                raise ValueError(f"Aggregated AUC differs at repetition {repetition}, fold {fold}")
+            if not _close(entry.get("PR"), float(expected["PR"])):
+                raise ValueError(f"Aggregated PR differs at repetition {repetition}, fold {fold}")
+
+    accumulated = _read_json(Path(run_dir) / "accumulated_test_metrics.json")
+    if not isinstance(accumulated, dict):
+        raise ValueError(f"Paired accumulated metrics are not a JSON object in {run_dir}")
+    for section in ("avg", "std"):
+        if not isinstance(accumulated.get(section), dict):
+            raise ValueError(f"Paired accumulated metrics are missing {section} in {run_dir}")
+
+    expected_values = {
+        "AUC": [float(fold_metrics[key]["AUC"]) for key in sorted(fold_metrics)],
+        "PR": [float(fold_metrics[key]["PR"]) for key in sorted(fold_metrics)],
+    }
+    expected_mean = {metric: mean(values) for metric, values in expected_values.items()}
+    expected_std = {
+        metric: pstdev(values) / math.sqrt(len(values)) for metric, values in expected_values.items()
+    }
+    for metric in ("AUC", "PR"):
+        if not _close(accumulated["avg"].get(metric), expected_mean[metric]):
+            raise ValueError(f"Accumulated avg differs for {metric} in {run_dir}")
+        if not _close(accumulated["std"].get(metric), expected_std[metric]):
+            raise ValueError(f"Accumulated std differs for {metric} in {run_dir}")
+
+
+def validate_completed_paired_run(run_dir: Path, require_aggregates: bool = True) -> None:
     count = paired_result_count(run_dir)
     if count != PAIRED_REPETITIONS * PAIRED_FOLDS:
         raise ValueError(f"Paired evaluation has {count}/25 valid fold results in {run_dir}")
+    _validate_fold_layout(run_dir)
     if require_aggregates:
-        aggregated = _read_json(Path(run_dir) / "aggregated_test_metrics.json")
-        accumulated = _read_json(Path(run_dir) / "accumulated_test_metrics.json")
-        if not isinstance(aggregated, dict) or not isinstance(accumulated, dict):
-            raise ValueError(f"Paired aggregate files are not JSON objects in {run_dir}")
-        if not _metrics_are_valid(accumulated.get("avg")) or not _metrics_are_valid(accumulated.get("std")):
-            raise ValueError(f"Paired accumulated metrics are incomplete or nonfinite in {run_dir}")
+        _validate_aggregate_files(run_dir, _fold_metrics(run_dir))
 
 
 def _metadata_request_matches(metadata: dict[str, Any], request: dict[str, Any]) -> bool:
@@ -312,6 +395,7 @@ def paired_output_status(
     metadata_path = run_dir / "paired_eval_metadata.json"
     if not metadata_path.is_file():
         raise ValueError(f"Existing paired output has no provenance metadata: {run_dir}")
+    repair_gpu_shadowed_target_metadata(run_dir)
     metadata = _read_json(metadata_path)
     request = _request_metadata(
         source_run,

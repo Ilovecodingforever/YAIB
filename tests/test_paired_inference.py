@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from statistics import mean, pstdev
 import subprocess
 
 import polars as pl
@@ -9,6 +10,7 @@ import pytest
 
 import icu_benchmarks.run as run_module
 import icu_benchmarks.cross_validation as cross_validation
+import icu_benchmarks.run_utils as run_utils
 from icu_benchmarks.constants import RunMode
 from icu_benchmarks.data.constants import DataSegment
 from icu_benchmarks.data.split_process_data import make_single_split_polars
@@ -29,6 +31,25 @@ from icu_benchmarks.run_utils import parse_args
 
 
 VARS = {"GROUP": "stay_id", "LABEL": "label"}
+
+
+def write_aggregate_files(output: Path) -> None:
+    aggregated = {}
+    scores = {"AUC": [], "PR": []}
+    for repetition in range(PAIRED_REPETITIONS):
+        aggregated[f"repetition_{repetition}"] = {}
+        for fold in range(PAIRED_FOLDS):
+            fold_dir = output / f"repetition_{repetition}" / f"fold_{fold}"
+            metrics = json.loads((fold_dir / "test_metrics.json").read_text())
+            aggregated[f"repetition_{repetition}"][f"fold_{fold}"] = metrics
+            for metric in scores:
+                scores[metric].append(metrics[metric])
+    accumulated = {
+        "avg": {metric: mean(values) for metric, values in scores.items()},
+        "std": {metric: pstdev(values) / (len(values) ** 0.5) for metric, values in scores.items()},
+    }
+    (output / "aggregated_test_metrics.json").write_text(json.dumps(aggregated))
+    (output / "accumulated_test_metrics.json").write_text(json.dumps(accumulated))
 
 
 def source_run(tmp_path: Path, config: str = "model = 'same'\n") -> Path:
@@ -148,6 +169,7 @@ def test_paired_output_resume_and_completion_validation(tmp_path):
     fold_dir = output / "repetition_4" / "fold_4"
     fold_dir.mkdir(parents=True, exist_ok=True)
     (fold_dir / "test_metrics.json").write_text(json.dumps({"AUC": 0.5, "PR": 0.2}))
+    write_aggregate_files(output)
     validate_completed_paired_run(output)
 
     resumed = prepare_paired_run(
@@ -184,10 +206,7 @@ def test_completed_output_requires_matching_seed_mapping_and_aggregates(tmp_path
             fold_dir = output / f"repetition_{repetition}" / f"fold_{fold}"
             fold_dir.mkdir(parents=True, exist_ok=True)
             (fold_dir / "test_metrics.json").write_text(json.dumps({"AUC": 0.5, "PR": 0.2}))
-    (output / "aggregated_test_metrics.json").write_text(json.dumps({"repetition_0": {}}))
-    (output / "accumulated_test_metrics.json").write_text(
-        json.dumps({"avg": {"AUC": 0.5, "PR": 0.2}, "std": {"AUC": 0.1, "PR": 0.1}})
-    )
+    write_aggregate_files(output)
     mark_paired_complete(output)
     assert (
         paired_output_status(
@@ -229,6 +248,146 @@ def test_completed_output_requires_matching_seed_mapping_and_aggregates(tmp_path
             tmp_path / "hirid",
             tmp_path / "hirid_15min",
         )
+
+
+def test_aggregate_validation_rejects_missing_and_unexpected_pairs(tmp_path):
+    output = tmp_path / "output"
+    for repetition in range(PAIRED_REPETITIONS):
+        for fold in range(PAIRED_FOLDS):
+            fold_dir = output / f"repetition_{repetition}" / f"fold_{fold}"
+            fold_dir.mkdir(parents=True)
+            (fold_dir / "test_metrics.json").write_text(json.dumps({"AUC": 0.5, "PR": 0.2}))
+    write_aggregate_files(output)
+    aggregated_path = output / "aggregated_test_metrics.json"
+    aggregated = json.loads(aggregated_path.read_text())
+    del aggregated["repetition_4"]
+    aggregated_path.write_text(json.dumps(aggregated))
+    with pytest.raises(ValueError, match="exactly repetitions"):
+        validate_completed_paired_run(output)
+
+    write_aggregate_files(output)
+    aggregated = json.loads(aggregated_path.read_text())
+    del aggregated["repetition_2"]["fold_3"]
+    aggregated["repetition_2"]["fold_5"] = {}
+    aggregated_path.write_text(json.dumps(aggregated))
+    with pytest.raises(ValueError, match="exactly folds"):
+        validate_completed_paired_run(output)
+
+
+@pytest.mark.parametrize("metric", ["AUC", "PR"])
+def test_aggregate_validation_rejects_fold_metric_mismatch(tmp_path, metric):
+    output = tmp_path / "output"
+    for repetition in range(PAIRED_REPETITIONS):
+        for fold in range(PAIRED_FOLDS):
+            fold_dir = output / f"repetition_{repetition}" / f"fold_{fold}"
+            fold_dir.mkdir(parents=True)
+            (fold_dir / "test_metrics.json").write_text(json.dumps({"AUC": 0.5, "PR": 0.2}))
+    write_aggregate_files(output)
+    aggregated_path = output / "aggregated_test_metrics.json"
+    aggregated = json.loads(aggregated_path.read_text())
+    aggregated["repetition_1"]["fold_2"][metric] += 0.01
+    aggregated_path.write_text(json.dumps(aggregated))
+    with pytest.raises(ValueError, match=f"Aggregated {metric}"):
+        validate_completed_paired_run(output)
+
+
+@pytest.mark.parametrize("section", ["avg", "std"])
+def test_aggregate_validation_rejects_accumulated_mismatch(tmp_path, section):
+    output = tmp_path / "output"
+    for repetition in range(PAIRED_REPETITIONS):
+        for fold in range(PAIRED_FOLDS):
+            fold_dir = output / f"repetition_{repetition}" / f"fold_{fold}"
+            fold_dir.mkdir(parents=True)
+            (fold_dir / "test_metrics.json").write_text(
+                json.dumps({"AUC": 0.5 + repetition / 100, "PR": 0.2 + fold / 100})
+            )
+    write_aggregate_files(output)
+    accumulated_path = output / "accumulated_test_metrics.json"
+    accumulated = json.loads(accumulated_path.read_text())
+    accumulated[section]["AUC"] += 0.01
+    accumulated_path.write_text(json.dumps(accumulated))
+    with pytest.raises(ValueError, match=f"Accumulated {section}"):
+        validate_completed_paired_run(output)
+
+
+def test_stale_aggregates_are_rebuilt_without_inference(tmp_path, monkeypatch):
+    source = source_run(tmp_path)
+    checkpoints = validate_source_run(source / "repetition_0" / "fold_0")[1]
+    output = tmp_path / "output"
+    prepare_paired_run(
+        output,
+        source,
+        checkpoints,
+        "hirid",
+        "hirid_15min",
+        "LSTM",
+        7,
+        tmp_path / "hirid",
+        tmp_path / "hirid_15min",
+    )
+    for repetition in range(PAIRED_REPETITIONS):
+        for fold in range(PAIRED_FOLDS):
+            fold_dir = output / f"repetition_{repetition}" / f"fold_{fold}"
+            fold_dir.mkdir(parents=True)
+            (fold_dir / "test_metrics.json").write_text(json.dumps({"AUC": 0.5, "PR": 0.2}))
+    write_aggregate_files(output)
+    aggregate_path = output / "aggregated_test_metrics.json"
+    aggregate_path.write_text(json.dumps({"repetition_0": {}}))
+    assert paired_result_count(output) == 25
+    assert (
+        paired_output_status(
+            output,
+            source,
+            checkpoints,
+            "hirid",
+            "hirid_15min",
+            "LSTM",
+            7,
+            tmp_path / "hirid",
+            tmp_path / "hirid_15min",
+        )
+        == "resume"
+    )
+
+    calls = []
+    monkeypatch.setattr(cross_validation, "preprocess_data", lambda *args, **kwargs: calls.append("preprocess"))
+    monkeypatch.setattr(cross_validation, "train_common", lambda *args, **kwargs: calls.append("train"))
+    cross_validation.execute_repeated_cv(
+        tmp_path / "target",
+        output,
+        seed=7,
+        eval_only=True,
+        load_weights=True,
+        source_dir=source / "repetition_0" / "fold_0",
+        mode=RunMode.classification,
+        paired_fold_eval=True,
+    )
+    # The real workflow reports resume, skips all valid folds, and then calls
+    # YAIB's unchanged aggregate_results() to regenerate both files.
+    assert calls == []
+    original_fold = (output / "repetition_0" / "fold_0" / "test_metrics.json").read_text()
+    monkeypatch.setattr(run_utils, "wandb_log", lambda *args, **kwargs: None)
+    run_utils.aggregate_results(output)
+    validate_completed_paired_run(output)
+    assert (output / "repetition_0" / "fold_0" / "test_metrics.json").read_text() == original_fold
+    assert not calls
+
+
+def test_source_seed_provenance_is_explicitly_unverified(tmp_path):
+    source = source_run(tmp_path)
+    checkpoints = validate_source_run(source / "repetition_0" / "fold_0")[1]
+    metadata = prepare_paired_run(
+        tmp_path / "output",
+        source,
+        checkpoints,
+        "hirid",
+        "hirid_15min",
+        "LSTM",
+        7,
+        tmp_path / "hirid",
+        tmp_path / "hirid_15min",
+    )
+    assert metadata["source_seed_status"] == "explicit_user_supplied; not present in source artifacts"
 
 
 def test_numeric_target_metadata_is_repaired_only_when_path_is_unambiguous(tmp_path):

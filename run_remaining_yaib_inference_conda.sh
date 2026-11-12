@@ -7,6 +7,8 @@ SOURCE_DATASETS="${SOURCE_DATASETS:-hirid hirid_15min hirid_5min miiv miiv_15min
 TARGET_DATASETS="${TARGET_DATASETS:-hirid hirid_15min hirid_5min miiv miiv_15min miiv_5min}"
 INCLUDE_MATCHED="${INCLUDE_MATCHED:-1}"
 ONLY="${ONLY:-}" # source:model:target, for one selected configuration
+# One explicit source-seed assertion applies to every selected source run.
+# Run separate subsets when source runs were created with different seeds.
 SEED="${SEED:-}"
 YAIB_ENV="${YAIB_ENV:-/home/mingzhul/projects/Simultaneous-EHR/repos/YAIB/.conda/yaib}"
 YAIB_CLI="$YAIB_ENV/bin/icu-benchmarks"
