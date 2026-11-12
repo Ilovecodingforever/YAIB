@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +83,8 @@ def validate_source_run(source_dir: Path) -> tuple[Path, dict[tuple[int, int], P
             if not config_path.is_file():
                 raise ValueError(f"Missing source configuration: {config_path}")
             checkpoint = checkpoint_file(fold_dir)
+            if not fold_result_is_valid(fold_dir):
+                raise ValueError(f"Missing or invalid source test metrics: {fold_dir / 'test_metrics.json'}")
             config = _compatible_config(config_path.read_text())
             if reference_config is None:
                 reference_config = config
@@ -171,15 +174,30 @@ def validate_alignment(
                 raise ValueError(f"Outer test IDs differ at repetition {repetition}")
 
 
+def _read_json(path: Path) -> Any:
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Unreadable JSON file: {path}") from error
+
+
+def _finite_metric(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+
+
+def _metrics_are_valid(metrics: Any) -> bool:
+    return isinstance(metrics, dict) and _finite_metric(metrics.get("AUC")) and _finite_metric(metrics.get("PR"))
+
+
 def fold_result_is_valid(fold_dir: Path) -> bool:
     metrics_path = Path(fold_dir) / "test_metrics.json"
     if not metrics_path.is_file():
         return False
     try:
-        metrics = json.loads(metrics_path.read_text())
-    except (OSError, json.JSONDecodeError):
+        metrics = _read_json(metrics_path)
+    except ValueError:
         return False
-    return isinstance(metrics, dict) and "AUC" in metrics and "PR" in metrics
+    return _metrics_are_valid(metrics)
 
 
 def paired_result_count(run_dir: Path) -> int:
@@ -259,10 +277,93 @@ def prepare_paired_run(
     return metadata
 
 
-def validate_completed_paired_run(run_dir: Path) -> None:
+def validate_completed_paired_run(run_dir: Path, require_aggregates: bool = False) -> None:
     count = paired_result_count(run_dir)
     if count != PAIRED_REPETITIONS * PAIRED_FOLDS:
         raise ValueError(f"Paired evaluation has {count}/25 valid fold results in {run_dir}")
+    if require_aggregates:
+        aggregated = _read_json(Path(run_dir) / "aggregated_test_metrics.json")
+        accumulated = _read_json(Path(run_dir) / "accumulated_test_metrics.json")
+        if not isinstance(aggregated, dict) or not isinstance(accumulated, dict):
+            raise ValueError(f"Paired aggregate files are not JSON objects in {run_dir}")
+        if not _metrics_are_valid(accumulated.get("avg")) or not _metrics_are_valid(accumulated.get("std")):
+            raise ValueError(f"Paired accumulated metrics are incomplete or nonfinite in {run_dir}")
+
+
+def _metadata_request_matches(metadata: dict[str, Any], request: dict[str, Any]) -> bool:
+    return {key: metadata.get(key) for key in request} == request
+
+
+def paired_output_status(
+    run_dir: Path,
+    source_run: Path,
+    checkpoints: dict[tuple[int, int], Path],
+    source_name: str,
+    target_name: str,
+    model: str,
+    seed: int,
+    source_data_dir: Path,
+    target_data_dir: Path,
+) -> str:
+    """Return ``new``, ``resume``, or ``complete`` after strict metadata checks."""
+    run_dir = Path(run_dir)
+    if not run_dir.exists() or not any(run_dir.iterdir()):
+        return "new"
+    metadata_path = run_dir / "paired_eval_metadata.json"
+    if not metadata_path.is_file():
+        raise ValueError(f"Existing paired output has no provenance metadata: {run_dir}")
+    metadata = _read_json(metadata_path)
+    request = _request_metadata(
+        source_run,
+        checkpoints,
+        source_name,
+        target_name,
+        model,
+        seed,
+        source_data_dir,
+        target_data_dir,
+    )
+    if not isinstance(metadata, dict) or not _metadata_request_matches(metadata, request):
+        raise ValueError(f"Existing paired output metadata does not match the requested run: {run_dir}")
+    if metadata.get("status") == "complete":
+        try:
+            validate_completed_paired_run(run_dir, require_aggregates=True)
+        except ValueError:
+            return "resume"
+        return "complete"
+    return "resume"
+
+
+def _target_name_from_output_path(run_dir: Path) -> str | None:
+    run_dir = Path(run_dir).resolve()
+    parents = run_dir.parents
+    if len(parents) < 6:
+        return None
+    if parents[0].name != "paired_5x5" or parents[3].name != "Mortality24":
+        return None
+    if parents[5].name != "logs_paired_5x5":
+        return None
+    return parents[4].name
+
+
+def repair_gpu_shadowed_target_metadata(run_dir: Path) -> bool:
+    """Repair only an unambiguous numeric target name left by the old GPU bug."""
+    metadata_path = Path(run_dir) / "paired_eval_metadata.json"
+    if not metadata_path.is_file():
+        raise ValueError(f"Missing paired metadata: {metadata_path}")
+    metadata = _read_json(metadata_path)
+    target_name = metadata.get("target_dataset") if isinstance(metadata, dict) else None
+    if not isinstance(target_name, str) or not target_name.isdigit():
+        return False
+    inferred = _target_name_from_output_path(run_dir)
+    target_data_dir = Path(metadata.get("target_data_dir", ""))
+    if inferred is None or target_data_dir.name != inferred or not target_data_dir.is_dir():
+        raise ValueError(f"Cannot unambiguously repair target dataset metadata in {run_dir}")
+    metadata["target_dataset"] = inferred
+    metadata["target_dataset_repaired_from"] = target_name
+    metadata["target_dataset_repair_basis"] = "paired output path and target_data_dir"
+    metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+    return True
 
 
 def mark_paired_complete(run_dir: Path) -> None:

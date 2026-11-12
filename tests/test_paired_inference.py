@@ -7,6 +7,7 @@ import subprocess
 import polars as pl
 import pytest
 
+import icu_benchmarks.run as run_module
 import icu_benchmarks.cross_validation as cross_validation
 from icu_benchmarks.constants import RunMode
 from icu_benchmarks.data.constants import DataSegment
@@ -14,8 +15,12 @@ from icu_benchmarks.data.split_process_data import make_single_split_polars
 from icu_benchmarks.paired_inference import (
     PAIRED_FOLDS,
     PAIRED_REPETITIONS,
+    fold_result_is_valid,
+    mark_paired_complete,
     paired_result_count,
+    paired_output_status,
     prepare_paired_run,
+    repair_gpu_shadowed_target_metadata,
     validate_alignment,
     validate_completed_paired_run,
     validate_source_run,
@@ -34,6 +39,7 @@ def source_run(tmp_path: Path, config: str = "model = 'same'\n") -> Path:
             fold_dir.mkdir(parents=True)
             (fold_dir / "train_config.gin").write_text(config)
             (fold_dir / "model.joblib").write_text("checkpoint")
+            (fold_dir / "test_metrics.json").write_text(json.dumps({"AUC": 0.5, "PR": 0.2}))
     return root
 
 
@@ -59,6 +65,23 @@ def test_incompatible_source_configuration_is_rejected(tmp_path):
     (root / "repetition_2" / "fold_1" / "train_config.gin").write_text("model = 'different'\n")
     with pytest.raises(ValueError, match="Incompatible source fold configuration"):
         validate_source_run(root / "repetition_0" / "fold_0")
+
+
+def test_source_run_requires_final_test_metrics(tmp_path):
+    root = source_run(tmp_path)
+    (root / "repetition_1" / "fold_3" / "test_metrics.json").unlink()
+    with pytest.raises(ValueError, match="Missing or invalid source test metrics"):
+        validate_source_run(root / "repetition_0" / "fold_0")
+
+
+def test_corrupt_or_nonfinite_fold_metrics_are_not_valid(tmp_path):
+    fold_dir = tmp_path / "fold"
+    fold_dir.mkdir()
+    metrics = fold_dir / "test_metrics.json"
+    metrics.write_text(json.dumps({"AUC": "not-a-number", "PR": 0.2}))
+    assert not fold_result_is_valid(fold_dir)
+    metrics.write_text(json.dumps({"AUC": float("nan"), "PR": 0.2}))
+    assert not fold_result_is_valid(fold_dir)
 
 
 def test_target_outer_test_partition_is_reused_by_all_inner_folds():
@@ -141,6 +164,167 @@ def test_paired_output_resume_and_completion_validation(tmp_path):
     assert resumed["status"] == "in_progress"
 
 
+def test_completed_output_requires_matching_seed_mapping_and_aggregates(tmp_path):
+    source = source_run(tmp_path)
+    checkpoints = validate_source_run(source / "repetition_0" / "fold_0")[1]
+    output = tmp_path / "paired"
+    prepare_paired_run(
+        output,
+        source,
+        checkpoints,
+        "hirid",
+        "hirid_15min",
+        "LSTM",
+        7,
+        tmp_path / "hirid",
+        tmp_path / "hirid_15min",
+    )
+    for repetition in range(5):
+        for fold in range(5):
+            fold_dir = output / f"repetition_{repetition}" / f"fold_{fold}"
+            fold_dir.mkdir(parents=True, exist_ok=True)
+            (fold_dir / "test_metrics.json").write_text(json.dumps({"AUC": 0.5, "PR": 0.2}))
+    (output / "aggregated_test_metrics.json").write_text(json.dumps({"repetition_0": {}}))
+    (output / "accumulated_test_metrics.json").write_text(
+        json.dumps({"avg": {"AUC": 0.5, "PR": 0.2}, "std": {"AUC": 0.1, "PR": 0.1}})
+    )
+    mark_paired_complete(output)
+    assert (
+        paired_output_status(
+            output,
+            source,
+            checkpoints,
+            "hirid",
+            "hirid_15min",
+            "LSTM",
+            7,
+            tmp_path / "hirid",
+            tmp_path / "hirid_15min",
+        )
+        == "complete"
+    )
+    with pytest.raises(ValueError, match="does not match"):
+        paired_output_status(
+            output,
+            source,
+            checkpoints,
+            "hirid",
+            "hirid_15min",
+            "LSTM",
+            8,
+            tmp_path / "hirid",
+            tmp_path / "hirid_15min",
+        )
+    mismatched = dict(checkpoints)
+    mismatched[(0, 0)] = tmp_path / "different-checkpoint"
+    with pytest.raises(ValueError, match="does not match"):
+        paired_output_status(
+            output,
+            source,
+            mismatched,
+            "hirid",
+            "hirid_15min",
+            "LSTM",
+            7,
+            tmp_path / "hirid",
+            tmp_path / "hirid_15min",
+        )
+
+
+def test_numeric_target_metadata_is_repaired_only_when_path_is_unambiguous(tmp_path):
+    source = source_run(tmp_path)
+    target_data = tmp_path / "data" / "hirid"
+    target_data.mkdir(parents=True)
+    output = tmp_path / "logs_paired_5x5" / "hirid" / "Mortality24" / "LSTM" / "_from_hirid" / "paired_5x5" / "run"
+    checkpoints = validate_source_run(source / "repetition_0" / "fold_0")[1]
+    metadata = prepare_paired_run(
+        output,
+        source,
+        checkpoints,
+        "hirid",
+        "hirid",
+        "LSTM",
+        7,
+        tmp_path / "data" / "hirid",
+        target_data,
+    )
+    metadata["target_dataset"] = "0"
+    (output / "paired_eval_metadata.json").write_text(json.dumps(metadata))
+    sentinel = output / "repetition_0" / "fold_0"
+    sentinel.mkdir(parents=True)
+    metrics = sentinel / "test_metrics.json"
+    metrics.write_text(json.dumps({"AUC": 0.81, "PR": 0.31}))
+    assert repair_gpu_shadowed_target_metadata(output)
+    assert json.loads((output / "paired_eval_metadata.json").read_text())["target_dataset"] == "hirid"
+    assert json.loads(metrics.read_text())["AUC"] == 0.81
+
+
+def test_run_keeps_target_name_when_cuda_is_available(tmp_path, monkeypatch):
+    source_dir = tmp_path / "source" / "2026-01-01" / "repetition_0" / "fold_0"
+    target_dir = tmp_path / "target"
+    captured = {}
+
+    monkeypatch.setattr(run_module, "setup_logging", lambda *args: None)
+    monkeypatch.setattr(run_module, "get_config_files", lambda *args: (["BinaryClassification"], ["LSTM"]))
+    monkeypatch.setattr(run_module, "get_mode", lambda: RunMode.classification)
+    monkeypatch.setattr(run_module, "load_pretrained_imputation_model", lambda *args: None)
+    monkeypatch.setattr(run_module, "update_wandb_config", lambda *args: None)
+    monkeypatch.setattr(run_module, "log_full_line", lambda *args, **kwargs: None)
+    monkeypatch.setattr(run_module.gin, "parse_config_file", lambda *args: None)
+    monkeypatch.setattr(run_module.gin, "query_parameter", lambda key: {"GROUP": "stay_id", "LABEL": "label"})
+    monkeypatch.setattr(run_module, "resolve_gin_value", lambda value: value)
+    monkeypatch.setattr(run_module, "validate_source_run", lambda path: (source_dir.parent.parent, {}))
+    monkeypatch.setattr(run_module, "validate_alignment", lambda *args: captured.update(source=args[2], target=args[3]))
+
+    def fake_prepare(run_dir, source_run_path, checkpoints, source_name, target_name, *args):
+        captured.update(output=run_dir, metadata_target=target_name)
+        return {}
+
+    monkeypatch.setattr(run_module, "prepare_paired_run", fake_prepare)
+    monkeypatch.setattr(run_module, "execute_repeated_cv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(run_module, "validate_completed_paired_run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(run_module, "aggregate_results", lambda *args, **kwargs: None)
+    monkeypatch.setattr(run_module, "mark_paired_complete", lambda *args: None)
+    monkeypatch.setattr(run_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(run_module.torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(run_module.torch.cuda, "get_device_name", lambda index: "fake-gpu")
+
+    run_module.main(
+        [
+            "-d",
+            str(target_dir),
+            "-t",
+            "BinaryClassification",
+            "-n",
+            "hirid",
+            "-tn",
+            "Mortality24",
+            "-m",
+            "LSTM",
+            "--eval",
+            "--paired-fold-eval",
+            "-sn",
+            "hirid",
+            "--source-dir",
+            str(source_dir),
+            "--paired-source-data-dir",
+            str(target_dir),
+            "--paired-source-seed",
+            "7",
+            "-s",
+            "7",
+            "--paired-run-dir",
+            str(tmp_path / "output"),
+        ]
+    )
+    assert captured == {
+        "source": "hirid",
+        "target": "hirid",
+        "output": tmp_path / "output",
+        "metadata_target": "hirid",
+    }
+
+
 def test_paired_cv_uses_matching_source_checkpoint_and_skips_completed(tmp_path, monkeypatch):
     source = source_run(tmp_path)
     output = tmp_path / "output"
@@ -213,6 +397,7 @@ def test_script_dry_run_discovers_one_configuration(tmp_path):
             fold_dir.mkdir(parents=True)
             (fold_dir / "train_config.gin").write_text("config")
             (fold_dir / "model.joblib").write_text("checkpoint")
+            (fold_dir / "test_metrics.json").write_text(json.dumps({"AUC": 0.5, "PR": 0.2}))
     (tmp_path / "data" / "hirid").mkdir(parents=True)
     (tmp_path / "data" / "hirid_15min").mkdir(parents=True)
     result = subprocess.run(

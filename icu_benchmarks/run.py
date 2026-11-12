@@ -56,7 +56,7 @@ def main(my_args=tuple(sys.argv[1:])):
     setup_logging(date_format, log_format, verbose)
     # Get arguments
     data_dir = Path(args.data_dir)
-    name = args.name
+    target_name = args.name
     task = args.task
     model = args.model
     reproducible = args.reproducible
@@ -82,9 +82,9 @@ def main(my_args=tuple(sys.argv[1:])):
     mode = get_mode()
 
     # Set experiment name
-    if name is None:
-        name = data_dir.name
-    logging.info(f"Running experiment {name}.")
+    if target_name is None:
+        target_name = data_dir.name
+    logging.info(f"Running experiment {target_name}.")
     logging.info(f"Task mode: {mode}.")
 
     # Set train size to fine tune size if fine tune is set, else use custom train size
@@ -102,7 +102,7 @@ def main(my_args=tuple(sys.argv[1:])):
         }
     )
 
-    log_dir_name = args.log_dir / name
+    log_dir_name = args.log_dir / target_name
     log_dir = (
         (log_dir_name / experiment)
         if experiment
@@ -112,9 +112,9 @@ def main(my_args=tuple(sys.argv[1:])):
 
     # Check cuda availability
     if torch.cuda.is_available():
-        for name in range(0, torch.cuda.device_count()):
+        for gpu_idx in range(0, torch.cuda.device_count()):
             log_full_line(
-                f"Available GPU {name}: {torch.cuda.get_device_name(name)}",
+                f"Available GPU {gpu_idx}: {torch.cuda.get_device_name(gpu_idx)}",
                 level=logging.INFO,
             )
     else:
@@ -146,7 +146,7 @@ def main(my_args=tuple(sys.argv[1:])):
                 args.paired_source_data_dir,
                 data_dir,
                 str(args.source_name),
-                str(name),
+                str(target_name),
                 args.paired_source_seed,
                 file_names,
                 vars,
@@ -158,7 +158,7 @@ def main(my_args=tuple(sys.argv[1:])):
                 source_run,
                 source_checkpoints,
                 str(args.source_name),
-                str(name),
+                str(target_name),
                 model,
                 args.paired_source_seed,
                 args.paired_source_data_dir,
@@ -240,6 +240,7 @@ def main(my_args=tuple(sys.argv[1:])):
             validate_completed_paired_run(run_dir)
         aggregate_results(run_dir, execution_time)
         if paired_fold_eval:
+            validate_completed_paired_run(run_dir, require_aggregates=True)
             mark_paired_complete(run_dir)
     except Exception as e:
         if paired_fold_eval:

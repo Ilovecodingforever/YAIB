@@ -37,12 +37,18 @@ has_checkpoint() {
   return 1
 }
 
+valid_test_metrics() {
+  python3 -c 'import json, math, sys; d=json.load(open(sys.argv[1])); ok=isinstance(d, dict) and all(isinstance(d.get(k), (int, float)) and not isinstance(d.get(k), bool) and math.isfinite(float(d[k])) for k in ("AUC", "PR")); raise SystemExit(0 if ok else 1)' "$1"
+}
+
 complete_source_run() {
   local run_dir="$1" repetition fold
   for repetition in 0 1 2 3 4; do
     for fold in 0 1 2 3 4; do
       [[ -f "$run_dir/repetition_$repetition/fold_$fold/train_config.gin" ]] || return 1
-      has_checkpoint "$run_dir/repetition_$repetition/fold_$fold" || return 1
+      local fold_dir="$run_dir/repetition_$repetition/fold_$fold"
+      has_checkpoint "$fold_dir" || return 1
+      [[ -f "$fold_dir/test_metrics.json" ]] && valid_test_metrics "$fold_dir/test_metrics.json" || return 1
     done
   done
 }
@@ -54,6 +60,8 @@ latest_source_run() {
   while IFS= read -r run_dir; do
     run_name="$(basename "$run_dir")"
     [[ "$run_name" == tmp* ]] && continue
+    [[ "$run_name" == _from_* ]] && continue
+    [[ "$run_name" == 20* ]] || continue
     if complete_source_run "$run_dir"; then
       selected="$run_dir"
       saw_selected=1
@@ -69,17 +77,16 @@ latest_source_run() {
   return 0
 }
 
-paired_output_is_complete() {
-  local output="$1" source_run="$2" source="$3" target="$4" model="$5"
-  local metadata="$output/paired_eval_metadata.json"
-  [[ -f "$metadata" ]] || return 1
-  grep -Fq '"protocol": "paired_5x5"' "$metadata" || return 1
-  grep -Fq "\"source_training_run\": \"$(readlink -f "$source_run")\"" "$metadata" || return 1
-  grep -Fq "\"source_dataset\": \"$source\"" "$metadata" || return 1
-  grep -Fq "\"target_dataset\": \"$target\"" "$metadata" || return 1
-  grep -Fq "\"model\": \"$model\"" "$metadata" || return 1
-  grep -Fq '"status": "complete"' "$metadata" || return 1
-  [[ "$(find "$output" -path '*/repetition_*/fold_*/test_metrics.json' -type f | wc -l)" -eq 25 ]]
+paired_output_status() {
+  local output="$1" source_run="$2" source="$3" target="$4" model="$5" seed="$6"
+  "$YAIB_ENV/bin/python" -c '
+import sys
+from pathlib import Path
+from icu_benchmarks.paired_inference import paired_output_status, validate_source_run
+output, source_run, source, target, model, seed, source_data, target_data = sys.argv[1:]
+_, checkpoints = validate_source_run(Path(source_run) / "repetition_0" / "fold_0")
+print(paired_output_status(Path(output), Path(source_run), checkpoints, source, target, model, int(seed), Path(source_data), Path(target_data)))
+' "$output" "$source_run" "$source" "$target" "$model" "$seed" "$DATA_ROOT/$source" "$DATA_ROOT/$target"
 }
 
 run_eval() {
@@ -100,7 +107,14 @@ run_eval() {
     echo "SKIP: missing processed data for $source -> $target" >&2
     return 0
   fi
-  if paired_output_is_complete "$output" "$source_run" "$source" "$target" "$model"; then
+  local output_status="new"
+  if [[ -n "$SEED" ]]; then
+    if ! output_status="$(paired_output_status "$output" "$source_run" "$source" "$target" "$model" "$SEED")"; then
+      echo "ERROR: paired output metadata is incompatible or unreadable: $output" >&2
+      return 1
+    fi
+  fi
+  if [[ "$output_status" == "complete" ]]; then
     echo "SKIP: completed paired run $source | $model | $target"
     return 0
   fi
