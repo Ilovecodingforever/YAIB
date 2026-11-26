@@ -30,6 +30,12 @@ def test_unknown_arguments_are_rejected(extra):
         parse_args([*REQUIRED, *extra])
 
 
+def test_reference_override_parses_as_a_target_path(tmp_path):
+    reference = tmp_path / "outc.parquet"
+    args = parse_args([*REQUIRED, "--split-reference-outcomes-path", str(reference)])
+    assert args.split_reference_outcomes_path == reference
+
+
 @pytest.mark.parametrize("sweep", sorted(Path("experiments").glob("*.yml")), ids=lambda p: p.stem)
 def test_sweep_commands_parse(sweep):
     # wandb fills in ${env} and ${program}; every other token must be a known argument

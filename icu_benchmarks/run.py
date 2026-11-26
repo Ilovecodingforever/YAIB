@@ -43,6 +43,34 @@ def get_mode(mode: gin.REQUIRED):
     return RunMode(mode)
 
 
+def _configured_split_reference() -> object:
+    try:
+        return resolve_gin_value(gin.query_parameter("preprocess.split_reference_outcomes_path"))
+    except (KeyError, ValueError):
+        return None
+
+
+def _apply_target_split_reference(args, source_config_loaded: bool) -> None:
+    """Apply the target reference after all source/model Gin config has been parsed."""
+    if args.split_reference_outcomes_path is not None:
+        gin.bind_parameter(
+            "preprocess.split_reference_outcomes_path",
+            str(args.split_reference_outcomes_path.expanduser().resolve()),
+        )
+
+    effective_reference = _configured_split_reference()
+    if args.paired_fold_eval and effective_reference is not None:
+        raise ValueError(
+            "--paired-fold-eval cannot be combined with reference-based splitting; "
+            "paired evaluation requires its existing default split-alignment protocol"
+        )
+    if source_config_loaded and args.split_reference_outcomes_path is None and effective_reference is not None:
+        raise ValueError(
+            "The source train_config.gin contains preprocess.split_reference_outcomes_path; "
+            "provide --split-reference-outcomes-path for the target dataset"
+        )
+
+
 def main(my_args=tuple(sys.argv[1:])):
     args = parse_args(my_args)
     # Set arguments for wandb sweep
@@ -138,6 +166,7 @@ def main(my_args=tuple(sys.argv[1:])):
         source_dir = args.source_dir
         logging.info(f"Will load weights from {source_dir} and bind train gin-config. Note: this might override your config.")
         gin.parse_config_file(source_dir / "train_config.gin")
+        _apply_target_split_reference(args, source_config_loaded=True)
         if paired_fold_eval:
             source_run, source_checkpoints = validate_source_run(source_dir)
             file_names = resolve_gin_value(gin.query_parameter("preprocess.file_names"))
@@ -169,6 +198,7 @@ def main(my_args=tuple(sys.argv[1:])):
     elif args.samples and args.source_dir is not None:  # Train model with limited samples and bind existing config
         logging.info("Binding train gin-config. Note: this might override your config.")
         gin.parse_config_file(args.source_dir / "train_config.gin")
+        _apply_target_split_reference(args, source_config_loaded=True)
         log_dir /= f"samples_{args.samples}"
         name_datasets(args.name, args.name, args.name)
         run_dir = create_run_dir(log_dir)
@@ -185,6 +215,7 @@ def main(my_args=tuple(sys.argv[1:])):
             else [model_path, Path(f"configs/tasks/{task}.gin")]
         )
         gin.parse_config_files_and_bindings(gin_config_files, args.hyperparams, finalize_config=False)
+        _apply_target_split_reference(args, source_config_loaded=False)
         log_full_line(f"Data directory: {data_dir.resolve()}", level=logging.INFO)
         run_dir = create_run_dir(log_dir)
         choose_and_bind_hyperparameters_optuna(

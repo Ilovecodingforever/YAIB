@@ -430,7 +430,11 @@ def test_run_keeps_target_name_when_cuda_is_available(tmp_path, monkeypatch):
     monkeypatch.setattr(run_module, "update_wandb_config", lambda *args: None)
     monkeypatch.setattr(run_module, "log_full_line", lambda *args, **kwargs: None)
     monkeypatch.setattr(run_module.gin, "parse_config_file", lambda *args: None)
-    monkeypatch.setattr(run_module.gin, "query_parameter", lambda key: {"GROUP": "stay_id", "LABEL": "label"})
+    monkeypatch.setattr(
+        run_module.gin,
+        "query_parameter",
+        lambda key: None if key == "preprocess.split_reference_outcomes_path" else {"GROUP": "stay_id", "LABEL": "label"},
+    )
     monkeypatch.setattr(run_module, "resolve_gin_value", lambda value: value)
     monkeypatch.setattr(run_module, "validate_source_run", lambda path: (source_dir.parent.parent, {}))
     monkeypatch.setattr(run_module, "validate_alignment", lambda *args: captured.update(source=args[2], target=args[3]))

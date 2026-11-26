@@ -166,6 +166,12 @@ def build_parser() -> ArgumentParser:
         help="Label to use for evaluation in case of multiple labels.",
         default=None,
     )
+    parser.add_argument(
+        "--split-reference-outcomes-path",
+        type=Path,
+        default=None,
+        help="Target outc.parquet used only to stratify reference-based splits.",
+    )
     return parser
 
 

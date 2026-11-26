@@ -3,13 +3,15 @@
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import gin
 import joblib
 import numpy as np
 import pytest
 
-import icu_benchmarks.run
+import icu_benchmarks.run as run_module
+from icu_benchmarks.constants import RunMode
 from icu_benchmarks.run import main
 
 ROOT = Path(__file__).parent.parent
@@ -27,7 +29,7 @@ def run(args, monkeypatch, cwd=ROOT):
     # main reads the configs relative to the repository. setup_logging (#260) expects the handlers that lightning only adds
     # when the root logger has none (not under pytest), and it would silence warnings for the remaining tests.
     monkeypatch.chdir(cwd)
-    monkeypatch.setattr(icu_benchmarks.run, "setup_logging", lambda *args: None)
+    monkeypatch.setattr(run_module, "setup_logging", lambda *args: None)
     main(args)
     gin.clear_config()
 
@@ -83,6 +85,83 @@ def test_unknown_model_is_rejected(tmp_path, monkeypatch):
             ["-d", "demo_data/mortality24/mimic_demo", "-t", "BinaryClassification", "-m", "NoSuchModel", "-l", str(tmp_path)],
             monkeypatch,
         )
+
+
+def test_target_reference_override_replaces_source_gin_binding(tmp_path):
+    source_reference = tmp_path / "hirid" / "outc.parquet"
+    target_reference = tmp_path / "miiv" / "outc.parquet"
+    args = SimpleNamespace(
+        split_reference_outcomes_path=target_reference,
+        paired_fold_eval=False,
+    )
+    gin.bind_parameter("preprocess.split_reference_outcomes_path", str(source_reference))
+    run_module._apply_target_split_reference(args, source_config_loaded=True)
+    assert gin.query_parameter("preprocess.split_reference_outcomes_path") == str(target_reference.resolve())
+
+
+def test_main_binds_target_reference_after_source_config(tmp_path, monkeypatch):
+    source_dir = tmp_path / "source" / "repetition_0" / "fold_0"
+    source_reference = tmp_path / "hirid" / "outc.parquet"
+    target_reference = tmp_path / "miiv" / "outc.parquet"
+    captured = {}
+
+    monkeypatch.setattr(run_module, "setup_logging", lambda *args: None)
+    monkeypatch.setattr(run_module, "get_config_files", lambda *args: (["BinaryClassification"], ["LSTM"]))
+    monkeypatch.setattr(run_module, "get_mode", lambda: RunMode.classification)
+    monkeypatch.setattr(run_module, "load_pretrained_imputation_model", lambda *args: None)
+    monkeypatch.setattr(run_module, "update_wandb_config", lambda *args: None)
+    monkeypatch.setattr(run_module, "log_full_line", lambda *args, **kwargs: None)
+    monkeypatch.setattr(run_module, "name_datasets", lambda *args: None)
+    monkeypatch.setattr(run_module.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(run_module, "aggregate_results", lambda *args, **kwargs: None)
+
+    def parse_config(path):
+        if Path(path).name == "train_config.gin":
+            gin.bind_parameter("preprocess.split_reference_outcomes_path", str(source_reference))
+
+    monkeypatch.setattr(run_module.gin, "parse_config_file", parse_config)
+
+    def fake_execute(*args, **kwargs):
+        captured["reference"] = gin.query_parameter("preprocess.split_reference_outcomes_path")
+        return 0
+
+    monkeypatch.setattr(run_module, "execute_repeated_cv", fake_execute)
+    run_module.main(
+        [
+            "-d",
+            str(tmp_path / "target-data"),
+            "-t",
+            "BinaryClassification",
+            "-m",
+            "LSTM",
+            "--eval",
+            "-sn",
+            "hirid",
+            "--source-dir",
+            str(source_dir),
+            "--split-reference-outcomes-path",
+            str(target_reference),
+            "-l",
+            str(tmp_path / "logs"),
+        ]
+    )
+    assert captured["reference"] == str(target_reference.resolve())
+
+
+def test_inherited_source_reference_requires_target_override(tmp_path):
+    args = SimpleNamespace(split_reference_outcomes_path=None, paired_fold_eval=False)
+    gin.bind_parameter("preprocess.split_reference_outcomes_path", str(tmp_path / "source-outc.parquet"))
+    with pytest.raises(ValueError, match="provide --split-reference-outcomes-path"):
+        run_module._apply_target_split_reference(args, source_config_loaded=True)
+
+
+def test_paired_fold_eval_rejects_reference_splitting(tmp_path):
+    args = SimpleNamespace(
+        split_reference_outcomes_path=tmp_path / "target-outc.parquet",
+        paired_fold_eval=True,
+    )
+    with pytest.raises(ValueError, match="cannot be combined with reference-based splitting"):
+        run_module._apply_target_split_reference(args, source_config_loaded=True)
 
 
 MORTALITY = ["-t", "BinaryClassification", "-tn", "Mortality24", "-m", "LogisticRegression", "--cpu"]

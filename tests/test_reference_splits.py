@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import polars as pl
 import pytest
+from sklearn.model_selection import StratifiedKFold
 
 from icu_benchmarks.constants import RunMode
 from icu_benchmarks.data.constants import DataSegment as Segment, DataSplit as Split
@@ -50,6 +51,9 @@ def test_reference_matches_all_five_by_five_splits_and_preserves_labels(tmp_path
     reference = tmp_path / "h48_reference.parquet"
     write_dataset(h12, h12_labels)
     write_dataset(h48, reference_labels)
+    for dataset in (h12, h48):
+        outcome = pl.read_parquet(dataset / "outc.parquet").sample(fraction=1.0, seed=23)
+        outcome.write_parquet(dataset / "outc.parquet")
     pl.DataFrame({"stay_id": ids, "label": reference_labels}).sample(fraction=1.0, seed=17).write_parquet(reference)
 
     for repetition in range(5):
@@ -63,6 +67,17 @@ def test_reference_matches_all_five_by_five_splits_and_preserves_labels(tmp_path
             assert not memberships[0] & memberships[1]
             assert not memberships[0] & memberships[2]
             assert not memberships[1] & memberships[2]
+            outer = list(StratifiedKFold(5, shuffle=True, random_state=42).split(ids, reference_labels))[repetition]
+            dev, test = outer
+            train, val = list(
+                StratifiedKFold(5, shuffle=True, random_state=42).split(dev, reference_labels[dev])
+            )[fold]
+            expected = {
+                Split.train: set(ids[dev[train]]),
+                Split.val: set(ids[dev[val]]),
+                Split.test: set(ids[test]),
+            }
+            assert {split: split_ids(h12_split, split) for split in expected} == expected
             assert h12_split[Split.train][Segment.outcome].sort("stay_id")["label"].to_list() == [
                 int(h12_labels[i]) for i in sorted(split_ids(h12_split, Split.train))
             ]

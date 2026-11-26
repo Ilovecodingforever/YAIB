@@ -389,11 +389,19 @@ def _reference_labels_for_stays(
 ) -> Optional[pl.Series]:
     if reference is None:
         return None
-    aligned = stays.to_frame().join(
-        reference.with_columns(pl.col(_id).cast(stays.dtype, strict=True)),
-        on=_id,
-        how="left",
+    if reference[_id].null_count() or reference[_id].n_unique() != reference.height:
+        raise ValueError("Reference outcomes must contain unique, non-missing stay IDs")
+    requested = stays.to_frame().with_row_index("_split_order")
+    aligned = (
+        requested.join(
+            reference.with_columns(pl.col(_id).cast(stays.dtype, strict=True)),
+            on=_id,
+            how="left",
+        )
+        .sort("_split_order")
     )
+    if aligned[_id].to_list() != stays.to_list():
+        raise ValueError("Reference labels are not aligned to the requested stay ID sequence")
     if aligned[label].null_count():
         raise ValueError("Reference labels could not be aligned to every target stay ID")
     return aligned[label]
