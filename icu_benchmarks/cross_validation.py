@@ -133,6 +133,7 @@ def execute_repeated_cv(
                 runmode=mode,
                 complete_train=complete_train,
                 target_transform=source_transform,
+                split_manifest_path=repetition_fold_dir / "split_manifest.parquet",
             )
             preprocess_time = datetime.now() - start_time
             start_time = datetime.now()

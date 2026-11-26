@@ -2,8 +2,10 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import os
 import pickle
+from numbers import Real
 from pathlib import Path
 from timeit import default_timer as timer
 from typing import Any, Iterable, Optional, Union
@@ -55,6 +57,8 @@ def preprocess_data(
     required_var_types: Optional[list[str]] = None,
     required_segments: Optional[list[str]] = None,
     target_transform: Optional[TargetTransform] = None,
+    split_reference_outcomes_path: Optional[Path | str] = None,
+    split_manifest_path: Optional[Path | str] = None,
 ) -> tuple[dict[str, dict[str, pl.DataFrame]], Optional[TargetTransform]]:
     """
     Perform loading, splitting, imputing and normalising of task data.
@@ -115,8 +119,25 @@ def preprocess_data(
     if runmode == RunMode.regression and isinstance(vars[VarType.label], list):
         vars[VarType.label] = vars[VarType.label][0]
 
+    reference_outcomes = None
+    reference_identity = None
+    if split_reference_outcomes_path is not None:
+        reference_path = Path(split_reference_outcomes_path).expanduser().resolve()
+        reference_outcomes, reference_fingerprint = _read_split_reference(
+            reference_path,
+            vars,
+            runmode,
+            cv_repetitions=cv_repetitions,
+            cv_folds=cv_folds,
+            train_size=train_size,
+        )
+        reference_identity = {
+            "path": str(reference_path),
+            "sha256": reference_fingerprint,
+        }
     dumped_file_names = json.dumps(file_names, sort_keys=True)
     dumped_vars = json.dumps(vars, sort_keys=True)
+    dumped_reference = json.dumps(reference_identity, sort_keys=True)
     # The modality selection changes vars and the excluded variables later on, so it must be part of the cache key
     dumped_modalities = json.dumps({"mapping": modality_mapping, "selected": selected_modalities}, sort_keys=True)
 
@@ -142,20 +163,39 @@ def preprocess_data(
         preprocessor_instance.set_imputation_model(pretrained_imputation_model)
 
     preprocessor_instance.target_transform = target_transform
-    hash_config = hashlib.md5(
+    hash_input = (
         f"{preprocessor_instance.to_cache_string()}{dumped_file_names}{dumped_vars}{dumped_modalities}{runmode}"
-        f"{target_transform}".encode("utf-8")
+        f"{target_transform}"
     )
+    if reference_identity is not None:
+        hash_input += dumped_reference
+    hash_config = hashlib.md5(hash_input.encode("utf-8"))
     cache_filename += f"_{hash_config.hexdigest()}"
     cache_file = cache_dir / cache_filename
     if generate_cache:
         preprocessor_instance.save_cache = data_dir / "preproc" / (cache_filename + "_recipe")
 
+    if reference_outcomes is not None:
+        target_outcome_file = data_dir / file_names[DataSegment.outcome]
+        target_ids = pl.read_parquet(target_outcome_file, columns=[vars[VarType.group]])
+        _validate_reference_ids(target_ids, reference_outcomes, vars[VarType.group])
+
     if load_cache:
         if cache_file.exists():
             with open(cache_file, "rb") as f:
                 logging.info(f"Loading cached data from {cache_file}.")
-                return pickle.load(f)
+                cached = pickle.load(f)
+            if split_manifest_path is not None and reference_identity is not None:
+                write_split_manifest(
+                    split_manifest_path,
+                    cached[0],
+                    vars[VarType.group],
+                    seed,
+                    repetition_index,
+                    fold_index,
+                    reference_identity,
+                )
+            return cached
         else:
             logging.info(f"No cached data found in {cache_file}, loading raw features.")
 
@@ -193,6 +233,7 @@ def preprocess_data(
             seed=seed,
             debug=debug,
             runmode=runmode,
+            split_reference_outcomes=reference_outcomes,
         )
     else:
         # If full train is set, we use all data for training/validation
@@ -203,6 +244,18 @@ def preprocess_data(
             seed=seed,
             debug=debug,
             runmode=runmode,
+            split_reference_outcomes=reference_outcomes,
+        )
+
+    if split_manifest_path is not None and reference_identity is not None:
+        write_split_manifest(
+            split_manifest_path,
+            sanitized_data,
+            vars[VarType.group],
+            seed,
+            repetition_index,
+            fold_index,
+            reference_identity,
         )
 
     # Apply preprocessing
@@ -238,6 +291,146 @@ def preprocess_data(
     logging.info("Finished preprocessing.")
 
     return sanitized_data, preprocessor_instance.target_transform
+
+
+def _read_split_reference(
+    path: Path,
+    vars: dict[str, str | list[str]],
+    runmode: RunMode,
+    cv_repetitions: int,
+    cv_folds: int,
+    train_size: Optional[float],
+) -> tuple[pl.DataFrame, str]:
+    """Read and validate labels used only for stratified partition assignment."""
+    if runmode is not RunMode.classification:
+        raise ValueError("split_reference_outcomes_path is supported only for classification runs")
+    if not path.is_file():
+        raise FileNotFoundError(f"Reference outcomes file does not exist: {path}")
+
+    _id = vars.get(VarType.group)
+    label = vars.get(VarType.label)
+    if not isinstance(_id, str) or not isinstance(label, str):
+        raise TypeError("Reference splitting requires string GROUP and LABEL variables")
+
+    try:
+        reference = pl.read_parquet(path)
+    except Exception as error:
+        raise ValueError(f"Could not read reference outcomes file {path}: {error}") from error
+
+    required_class_count = cv_folds if train_size else max(cv_folds, cv_repetitions)
+    _validate_reference_frame(reference, _id, label, required_class_count, str(path))
+
+    # Hash sorted semantic content so harmless row reordering does not change cache identity.
+    canonical = json.dumps(reference.select([_id, label]).sort(_id).to_dict(as_series=False), sort_keys=True, default=str)
+    fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return reference.select([_id, label]), fingerprint
+
+
+def _validate_reference_frame(
+    reference: pl.DataFrame,
+    _id: str,
+    label: str,
+    required_class_count: int,
+    source: str,
+) -> None:
+    missing = [column for column in (_id, label) if column not in reference.columns]
+    if missing:
+        raise ValueError(f"Reference outcomes file {source} is missing required columns: {', '.join(missing)}")
+    if reference[_id].null_count():
+        raise ValueError(f"Reference outcomes file {source} contains missing {_id} values")
+    if reference[_id].n_unique() != reference.height:
+        raise ValueError(f"Reference outcomes file {source} contains duplicate {_id} values")
+
+    values = reference[label].to_list()
+    if not values:
+        raise ValueError(f"Reference outcomes file {source} contains no outcomes")
+    for value in values:
+        if value is None:
+            raise ValueError(f"Reference outcomes file {source} contains missing {label} values")
+        if isinstance(value, Real):
+            numeric_value = float(value)
+            if not math.isfinite(numeric_value):
+                raise ValueError(f"Reference outcomes file {source} contains non-finite {label} values")
+            if not numeric_value.is_integer():
+                raise ValueError(f"Reference outcomes file {source} contains continuous {label} values")
+
+    if reference[label].n_unique() < 2:
+        raise ValueError(f"Reference outcomes file {source} must contain at least two classes")
+    minimum_class_count = reference.group_by(label).len().get_column("len").min()
+    if minimum_class_count < required_class_count:
+        raise ValueError(
+            f"Reference labels have only {minimum_class_count} samples in their smallest class, "
+            f"but {required_class_count} stratified folds are required"
+        )
+
+
+def _validate_reference_ids(target_outcomes: pl.DataFrame, reference: pl.DataFrame, _id: str) -> None:
+    """Require exact target/reference stay membership before any split is generated."""
+    if target_outcomes[_id].null_count():
+        raise ValueError(f"Target outcomes contain missing {_id} values")
+    target_ids = set(target_outcomes[_id].unique().to_list())
+    reference_ids = set(reference[_id].to_list())
+    missing = target_ids - reference_ids
+    extra = reference_ids - target_ids
+    if missing or extra:
+        details = []
+        if missing:
+            details.append(f"missing reference IDs ({len(missing)})")
+        if extra:
+            details.append(f"extra reference IDs ({len(extra)})")
+        raise ValueError("Reference and target outcomes must contain exactly the same stay IDs: " + ", ".join(details))
+
+
+def _reference_labels_for_stays(
+    stays: pl.Series,
+    reference: Optional[pl.DataFrame],
+    _id: str,
+    label: str,
+) -> Optional[pl.Series]:
+    if reference is None:
+        return None
+    aligned = stays.to_frame().join(
+        reference.with_columns(pl.col(_id).cast(stays.dtype, strict=True)),
+        on=_id,
+        how="left",
+    )
+    if aligned[label].null_count():
+        raise ValueError("Reference labels could not be aligned to every target stay ID")
+    return aligned[label]
+
+
+def write_split_manifest(
+    path: Path | str,
+    data: dict[str, dict[str, pl.DataFrame]],
+    _id: str,
+    seed: int,
+    repetition: int,
+    fold: int,
+    reference_identity: dict[str, str],
+) -> None:
+    """Persist split membership beside a run, never beside the source dataset."""
+    rows = []
+    for split in (DataSplit.train, DataSplit.val, DataSplit.test):
+        rows.append(
+            data[split][DataSegment.outcome]
+            .select(_id)
+            .unique()
+            .with_columns(split=pl.lit(split))
+        )
+    manifest = (
+        pl.concat(rows, how="vertical")
+        .with_columns(
+            seed=pl.lit(seed),
+            repetition=pl.lit(repetition),
+            fold=pl.lit(fold),
+            reference_path=pl.lit(reference_identity["path"]),
+            reference_sha256=pl.lit(reference_identity["sha256"]),
+        )
+        .select(["seed", "repetition", "fold", "split", _id, "reference_path", "reference_sha256"])
+    )
+    manifest_path = Path(path)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_parquet(manifest_path)
 
 
 def flatten_column_names(*args: object) -> list[str]:
@@ -334,6 +527,7 @@ def make_train_val_pandas(
     seed: int = 42,
     debug: bool = False,
     runmode: RunMode = RunMode.classification,
+    split_reference_outcomes: Optional[pl.DataFrame | pd.DataFrame] = None,
 ) -> dict[str, dict[str, pd.DataFrame]]:
     """
     Randomly splits the data into training and validation sets for fitting a full model,
@@ -349,6 +543,18 @@ def make_train_val_pandas(
             f"got {type(_id)} and {type(label)} instead."
         )
 
+    reference = None
+    if split_reference_outcomes is not None:
+        if runmode is not RunMode.classification:
+            raise ValueError("split_reference_outcomes is supported only for classification runs")
+        reference = (
+            split_reference_outcomes
+            if isinstance(split_reference_outcomes, pl.DataFrame)
+            else pl.DataFrame(split_reference_outcomes)
+        )
+        _validate_reference_frame(reference, _id, label, 2, "provided reference outcomes")
+        _validate_reference_ids(pl.DataFrame(data[DataSegment.outcome]), reference, _id)
+
     if debug:
         logging.info("Using only 1% of the data for debugging. Note that this might lead to errors for small datasets.")
         data[DataSegment.outcome] = data[DataSegment.outcome].sample(frac=0.01, random_state=seed)
@@ -356,7 +562,13 @@ def make_train_val_pandas(
     stays = data[DataSegment.outcome][_id].unique()
 
     if VarType.label in vars and runmode is RunMode.classification:
-        labels = data[DataSegment.outcome].groupby(_id)[label].max()
+        if reference is None:
+            labels = data[DataSegment.outcome].groupby(_id)[label].max()
+        else:
+            labels = (
+                pd.DataFrame({_id: stays})
+                .merge(reference.to_pandas(), on=_id, how="left", sort=False)[label]
+            )
         train_val_splitter = StratifiedShuffleSplit(train_size=train_size, random_state=seed, n_splits=1)
         train_indices, val_indices = list(train_val_splitter.split(stays, labels))[0]
     else:
@@ -393,6 +605,7 @@ def make_train_val_polars(
     seed: int = 42,
     debug: bool = False,
     runmode: RunMode = RunMode.classification,
+    split_reference_outcomes: Optional[pl.DataFrame | pd.DataFrame] = None,
 ) -> dict[str, dict[str, pl.DataFrame]]:
     """
     Randomly splits the data into training and validation sets for fitting a full model,
@@ -408,6 +621,18 @@ def make_train_val_polars(
             f"got {type(_id)} and {type(label)} instead."
         )
 
+    reference = None
+    if split_reference_outcomes is not None:
+        if runmode is not RunMode.classification:
+            raise ValueError("split_reference_outcomes is supported only for classification runs")
+        reference = (
+            split_reference_outcomes
+            if isinstance(split_reference_outcomes, pl.DataFrame)
+            else pl.DataFrame(split_reference_outcomes)
+        )
+        _validate_reference_frame(reference, _id, label, 2, "provided reference outcomes")
+        _validate_reference_ids(data[DataSegment.outcome], reference, _id)
+
     if debug:
         logging.info("Using only 1% of the stay_id's for debugging. Note that this might lead to errors for small datasets.")
         sampled_ids = data[DataSegment.outcome][_id].unique().sample(fraction=0.01, seed=seed)
@@ -421,7 +646,11 @@ def make_train_val_polars(
     stays = pl.Series(name=_id, values=data[DataSegment.outcome][_id].unique()).sort()
 
     if VarType.label in vars and runmode is RunMode.classification:
-        labels = data[DataSegment.outcome].group_by(_id).max().sort(_id)[label]
+        labels = (
+            data[DataSegment.outcome].group_by(_id).max().sort(_id)[label]
+            if reference is None
+            else _reference_labels_for_stays(stays, reference, _id, label)
+        )
         train_val_splitter = StratifiedShuffleSplit(train_size=train_size, random_state=seed, n_splits=1)
         train_indices, val_indices = list(train_val_splitter.split(stays, labels))[0]
     else:
@@ -460,6 +689,7 @@ def make_train_val(
     debug: bool = False,
     runmode: RunMode = RunMode.classification,
     polars: bool = True,
+    split_reference_outcomes: Optional[pl.DataFrame | pd.DataFrame] = None,
 ) -> dict[str, dict[str, pl.DataFrame]] | dict[str, dict[str, pd.DataFrame]]:
     """
     Randomly splits the data into training and validation sets for fitting a full model.
@@ -482,10 +712,26 @@ def make_train_val(
     """
     if polars:
         polars_data = {k: v if isinstance(v, pl.DataFrame) else pl.DataFrame(v) for k, v in data.items()}
-        return make_train_val_polars(polars_data, vars, train_size, seed, debug, runmode)
+        return make_train_val_polars(
+            polars_data,
+            vars,
+            train_size,
+            seed,
+            debug,
+            runmode,
+            split_reference_outcomes,
+        )
     else:
         pandas_data = {k: v if isinstance(v, pd.DataFrame) else v.to_pandas() for k, v in data.items()}
-        return make_train_val_pandas(pandas_data, vars, train_size, seed, debug, runmode)
+        return make_train_val_pandas(
+            pandas_data,
+            vars,
+            train_size,
+            seed,
+            debug,
+            runmode,
+            split_reference_outcomes,
+        )
 
 
 # Use these helper functions in both make_train_val and make_single_split
@@ -500,6 +746,7 @@ def make_single_split_pandas(
     seed: int = 42,
     debug: bool = False,
     runmode: RunMode = RunMode.classification,
+    split_reference_outcomes: Optional[pl.DataFrame | pd.DataFrame] = None,
 ) -> dict[str, dict[str, pd.DataFrame]]:
     """
     Randomly splits the data into training, validation, and test sets,
@@ -516,6 +763,24 @@ def make_single_split_pandas(
             f"got {type(_id)} and {type(label)} instead."
         )
 
+    reference = None
+    if split_reference_outcomes is not None:
+        if runmode is not RunMode.classification:
+            raise ValueError("split_reference_outcomes is supported only for classification runs")
+        reference = (
+            split_reference_outcomes
+            if isinstance(split_reference_outcomes, pl.DataFrame)
+            else pl.DataFrame(split_reference_outcomes)
+        )
+        _validate_reference_frame(
+            reference,
+            _id,
+            label,
+            max(cv_folds, cv_repetitions if not train_size else 2),
+            "provided reference outcomes",
+        )
+        _validate_reference_ids(pl.DataFrame(data[DataSegment.outcome]), reference, _id)
+
     if debug:
         logging.info("Using only 1% of the data for debugging. Note that this might lead to errors for small datasets.")
         data[DataSegment.outcome] = data[DataSegment.outcome].sample(frac=0.01, random_state=seed)
@@ -523,7 +788,13 @@ def make_single_split_pandas(
     stays = data[DataSegment.outcome][_id].unique()
 
     if VarType.label in vars and runmode is RunMode.classification:
-        labels = data[DataSegment.outcome].groupby(_id)[label].max().reset_index(drop=True)
+        if reference is None:
+            labels = data[DataSegment.outcome].groupby(_id)[label].max().reset_index(drop=True)
+        else:
+            labels = (
+                pd.DataFrame({_id: stays})
+                .merge(reference.to_pandas(), on=_id, how="left", sort=False)[label]
+            )
         if labels.value_counts().min() < cv_folds:
             raise Exception(
                 f"The smallest amount of samples in a class is: {labels.value_counts().min()}, "
@@ -579,6 +850,7 @@ def make_single_split_polars(
     seed: int = 42,
     debug: bool = False,
     runmode: RunMode = RunMode.classification,
+    split_reference_outcomes: Optional[pl.DataFrame | pd.DataFrame] = None,
 ) -> dict[str, dict[str, pl.DataFrame]]:
     """
     Randomly splits the data into training, validation, and test set,
@@ -588,6 +860,26 @@ def make_single_split_polars(
     """
     # ID variable
     _id = vars[VarType.group]
+    label = vars.get(VarType.label)
+    reference = None
+    if split_reference_outcomes is not None:
+        if runmode is not RunMode.classification:
+            raise ValueError("split_reference_outcomes is supported only for classification runs")
+        reference = (
+            split_reference_outcomes
+            if isinstance(split_reference_outcomes, pl.DataFrame)
+            else pl.DataFrame(split_reference_outcomes)
+        )
+        if not isinstance(label, str):
+            raise TypeError("Reference splitting requires a single string LABEL variable")
+        _validate_reference_frame(
+            reference,
+            _id,
+            label,
+            max(cv_folds, cv_repetitions if not train_size else 2),
+            "provided reference outcomes",
+        )
+        _validate_reference_ids(data[DataSegment.outcome], reference, _id)
     if debug:
         logging.info("Using only 1% of the stay_id's for debugging. Note that this might lead to errors for small datasets.")
         sampled_ids = data[DataSegment.outcome][_id].unique().sample(fraction=0.01, seed=seed)
@@ -602,7 +894,11 @@ def make_single_split_polars(
     # If there are labels, and the task is classification, use stratified k-fold
     if VarType.label in vars and runmode is RunMode.classification:
         # Get labels from outcome data (takes the highest value (or True) in case seq2seq classification)
-        labels: pl.Series = data[DataSegment.outcome].group_by(_id).max().sort(_id)[vars[VarType.label]]
+        labels: pl.Series = (
+            data[DataSegment.outcome].group_by(_id).max().sort(_id)[vars[VarType.label]]
+            if reference is None
+            else _reference_labels_for_stays(stays, reference, _id, label)
+        )
         if labels.value_counts().min().item(0, 1) < cv_folds:
             raise Exception(
                 f"The smallest amount of samples in a class is: {labels.value_counts().min()}, "
@@ -669,6 +965,7 @@ def make_single_split(
     debug: bool = False,
     runmode: RunMode = RunMode.classification,
     polars: bool = True,
+    split_reference_outcomes: Optional[pl.DataFrame | pd.DataFrame] = None,
 ) -> dict[str, dict[str, pl.DataFrame]] | dict[str, dict[str, pd.DataFrame]]:
     """
     Randomly splits the data into training, validation, and test sets.
@@ -704,6 +1001,7 @@ def make_single_split(
             seed,
             debug,
             runmode,
+            split_reference_outcomes,
         )
     else:
         pandas_data = {k: v if isinstance(v, pd.DataFrame) else v.to_pandas() for k, v in data.items()}
@@ -718,6 +1016,7 @@ def make_single_split(
             seed,
             debug,
             runmode,
+            split_reference_outcomes,
         )
 
 
